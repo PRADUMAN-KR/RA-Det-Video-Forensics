@@ -1,6 +1,23 @@
 # RA-Det Video Forensics
+Research implementation extending the RA-Det framework from image-level representation analysis to temporal video representation analysis for detecting modern AI-generated videos, including neural rendering, diffusion-based generation, and next-generation deepfakes.
 
-This repository adapts the **RA-Det** (Robustness Asymmetry Detection) framework for video forensics, extending its capabilities to detect AI-generated and manipulated multimodal content.
+
+## 📖 Overview
+
+While the original RA-Det framework focuses on image-based generative artifacts by probing robustness asymmetry (where synthetic images exhibit larger feature drift under small perturbations than natural images), this project extends those principles to temporal media. 
+
+RA-Det-Video-Forensics is a research project that investigates whether the core ideas introduced in RA-Det can be extended from static images to videos.
+
+Unlike conventional deepfake detectors that primarily rely on low-level visual artifacts, this project explores representation-aware temporal analysis, where the behavior of semantic feature representations is analyzed across time to detect synthetic videos.
+
+The long-term goal is to improve the detection of modern AI-generated videos produced by:
+
+Neural Rendering
+Diffusion-based Video Models
+Talking-Head Generation Models
+Face Reenactment Models
+Future Video Foundation Models
+
 
 ## 🏆 Acknowledgments and Credits
 
@@ -13,11 +30,7 @@ If you build upon the code in this repository, please ensure you cite the origin
 
 ---
 
-## 📖 Overview
 
-While the original RA-Det framework focuses on image-based generative artifacts by probing robustness asymmetry (where synthetic images exhibit larger feature drift under small perturbations than natural images), this project extends those principles to temporal media. 
-
-This repository expands the framework to include robust temporal modeling and audio-visual alignment, aiming to identify artifacts specific to video generation and manipulation, such as deepfake lip-sync anomalies and cross-modal inconsistencies.
 
 ## ⚙️ Installation
 
@@ -28,3 +41,6 @@ cd RA-Det-Video-Forensics
 
 # Install dependencies
 pip install -r requirements.txt
+
+
+
