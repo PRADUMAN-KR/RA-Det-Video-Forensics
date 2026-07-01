@@ -240,11 +240,25 @@ class LocalPixelDependencyStrategy(BaseInputStrategy):
         Apply LPD (Zero-Masked Median Deviation) preprocessing.
 
         Args:
-            image: Tensor of shape (C, H, W) or (B, C, H, W)
+            image: Tensor of shape (C, H, W), (B, C, H, W), or (B, C, T, H, W)
 
         Returns:
             LPD Feature Map tensor
         """
+        if image.dim() == 5:
+            # Handle spatiotemporal video tensor [B, C, T, H, W]
+            B, C, T, H, W = image.shape
+            # Fold batch and time dimensions: [B*T, C, H, W]
+            reshaped_image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            
+            # Preprocess the folded image tensor in 2D
+            lpd_flat = self.preprocess(reshaped_image)  # [B*T, C_out, H, W]
+            
+            # Reshape back to [B, C_out, T, H, W]
+            C_out = lpd_flat.shape[1]
+            result = lpd_flat.view(B, T, C_out, H, W).permute(0, 2, 1, 3, 4)
+            return result
+
         if image.dim() == 3:
             image = image.unsqueeze(0)
             squeeze_output = True

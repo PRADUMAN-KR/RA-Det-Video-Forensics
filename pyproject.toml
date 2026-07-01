@@ -1,0 +1,37 @@
+[project]
+name = "ra-det"
+version = "0.1.0"
+description = "Temporal Representation Analysis for AI-Generated Video Detection"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Core deep learning
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+
+    # Data processing
+    "Pillow>=9.0.0",
+    "numpy>=1.21.0",
+
+    # Metrics & evaluation
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+
+    # Progress bars
+    "tqdm>=4.62.0",
+
+    # Video & spatiotemporal transformers
+    "transformers>=4.30.0",
+    "decord>=0.6.0",
+    "av>=10.0.0",
+    "accelerate>=0.20.0",
+]
+
+[tool.uv]
+# PyTorch with CUDA 12.x — matches RTX 5090 / container CUDA
+index-url = "https://download.pytorch.org/whl/cu121"
+extra-index-url = ["https://pypi.org/simple"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -193,6 +193,7 @@ class AdaptiveSmoothedStrategy(SmoothedDifferenceStrategy):
     def _compute_adaptive_sigmas(self, image: torch.Tensor) -> List[torch.Tensor]:
         """Compute adaptive sigma values based on image content"""
         batch_size = image.shape[0]
+        channels = image.shape[1]
         adaptive_sigmas = []
 
         for i in range(batch_size):

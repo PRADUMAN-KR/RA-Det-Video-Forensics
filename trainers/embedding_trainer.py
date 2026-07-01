@@ -26,7 +26,7 @@ from datetime import datetime
 _FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Add release root to sys.path for local imports
-RELEASE_ROOT = os.path.dirname(os.path.dirname(_FILE_DIR))
+RELEASE_ROOT = os.path.dirname(_FILE_DIR)
 if RELEASE_ROOT not in sys.path:
     sys.path.insert(0, RELEASE_ROOT)
 
@@ -60,7 +60,7 @@ if anyattack_dir in sys.path:
     sys.path.remove(anyattack_dir)
 
 # Add release root directory to path for local create_models
-release_root = os.path.dirname(os.path.dirname(_FILE_DIR))
+release_root = os.path.dirname(_FILE_DIR)
 if release_root not in sys.path:
     sys.path.insert(0, release_root)
 
@@ -582,42 +582,66 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
         local_diff_probs = []  # Embedding diff branch probabilities (for 4-branch ensemble)
 
         for batch in tqdm(test_dataloader, desc="Cross-generator eval", disable=self.rank != 0):
-            images = batch['image'].to(self.device)
-            labels = batch['label'].to(self.device)
-            generators = batch['generator']
+            is_video = 'video' in batch
 
-            # Generate noise
-            clean_embeddings = encoder.encode_image(images)
+            if is_video:
+                video = batch['video'].to(self.device)  # [B, T, C, H, W]
+                labels = batch['label'].to(self.device)
+                generators = batch['generator']
 
-            # Handle different decoder types
-            # AnyAttackDecoder: noise = decoder(embeddings)
-            # UNetDecoder: noise = decoder(original_image, clean_embedding, multi_scale_images)
-            decoder_model = decoder.module if hasattr(decoder, 'module') else decoder
+                # Permute video channels for UNet3D input: [B, C, T, H, W]
+                video_c_first = video.permute(0, 2, 1, 3, 4)
 
-            if hasattr(decoder_model, 'fc'):  # AnyAttackDecoder
-                noise = decoder(clean_embeddings)
-            else:  # UNetDecoder
-                # Prepare multi-scale images if strategy is available
-                multi_scale_images = None
-                if strategy is not None and use_multi_scale_decoder:
-                    # Denormalize images for strategy processing (ImageNet normalization)
-                    mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
-                    denorm_images = images * std + mean
-                    multi_scale_images = strategy.preprocess(denorm_images)
-                    # Normalize from [0, 1] to [-1, 1] to match the original_image range
-                    multi_scale_images = multi_scale_images * 2 - 1
+                # Extract embeddings using VideoMAE
+                clean_embeddings = encoder(video)
 
-                noise = decoder(original_image=images, clean_embedding=clean_embeddings, multi_scale_images=multi_scale_images)
+                # Generate spatiotemporal noise
+                noise = decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
 
-            #noise = torch.clamp(noise, -eps, eps)
+                # Extract perturbed embeddings
+                perturbed_video = (video_c_first + noise).permute(0, 2, 1, 3, 4)
+                noisy_embeddings = encoder(perturbed_video)
 
-            noisy_images = images + noise
-            noisy_embeddings = encoder.encode_image(noisy_images)
+                # Compute metrics
+                similarity = F.cosine_similarity(clean_embeddings, noisy_embeddings, dim=1)
+                l2_dist = torch.norm(clean_embeddings - noisy_embeddings, dim=1)
+            else:
+                images = batch['image'].to(self.device)
+                labels = batch['label'].to(self.device)
+                generators = batch['generator']
 
-            # Compute similarity
-            similarity = F.cosine_similarity(clean_embeddings, noisy_embeddings, dim=1)
-            l2_dist = torch.norm(clean_embeddings - noisy_embeddings, dim=1)
+                # Generate noise
+                clean_embeddings = encoder.encode_image(images)
+
+                # Handle different decoder types
+                # AnyAttackDecoder: noise = decoder(embeddings)
+                # UNetDecoder: noise = decoder(original_image, clean_embedding, multi_scale_images)
+                decoder_model = decoder.module if hasattr(decoder, 'module') else decoder
+
+                if hasattr(decoder_model, 'fc'):  # AnyAttackDecoder
+                    noise = decoder(clean_embeddings)
+                else:  # UNetDecoder
+                    # Prepare multi-scale images if strategy is available
+                    multi_scale_images = None
+                    if strategy is not None and use_multi_scale_decoder:
+                        # Denormalize images for strategy processing (ImageNet normalization)
+                        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
+                        std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
+                        denorm_images = images * std + mean
+                        multi_scale_images = strategy.preprocess(denorm_images)
+                        # Normalize from [0, 1] to [-1, 1] to match the original_image range
+                        multi_scale_images = multi_scale_images * 2 - 1
+
+                    noise = decoder(original_image=images, clean_embedding=clean_embeddings, multi_scale_images=multi_scale_images)
+
+                #noise = torch.clamp(noise, -eps, eps)
+
+                noisy_images = images + noise
+                noisy_embeddings = encoder.encode_image(noisy_images)
+
+                # Compute similarity
+                similarity = F.cosine_similarity(clean_embeddings, noisy_embeddings, dim=1)
+                l2_dist = torch.norm(clean_embeddings - noisy_embeddings, dim=1)
 
             # Get classifier probabilities if available
             if classifier is not None:
@@ -632,7 +656,41 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     or (has_branch_names and not is_ablation and not is_noise_embedding)
                 )
 
-                if is_ensemble:
+                if is_video:
+                    lpd_features = None
+                    if lpd_strategy is not None:
+                        lpd_features = lpd_strategy.preprocess(video)
+
+                    inputs = {
+                        "video": video,
+                        "noise": noise,
+                        "lpd_features": lpd_features,
+                        "l2_distance": l2_dist.unsqueeze(1),
+                        "embedding_diff": clean_embeddings - noisy_embeddings
+                    }
+
+                    outputs = classifier_model(use_max_for_eval=True, **inputs)
+                    if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
+                        ensemble_logits, branch_logits = outputs
+                    else:
+                        ensemble_logits = outputs
+                        branch_logits = {"ensemble": outputs}
+
+                    cls_probs = torch.sigmoid(ensemble_logits.squeeze(-1))
+                    local_probs.extend(cls_probs.cpu().numpy())
+
+                    for branch_name, branch_logits in branch_logits.items():
+                        branch_probs = torch.sigmoid(branch_logits.squeeze(-1))
+                        if branch_name == "foundation":
+                            local_foundation_probs.extend(branch_probs.cpu().numpy())
+                        elif branch_name == "scratch":
+                            local_scratch_probs.extend(branch_probs.cpu().numpy())
+                        elif branch_name == "l2_distance":
+                            local_l2_probs.extend(branch_probs.cpu().numpy())
+                        elif branch_name == "embedding_diff":
+                            local_diff_probs.extend(branch_probs.cpu().numpy())
+
+                elif is_ensemble:
                     # EnsembleClassifier needs multi_scale_raw_images and lpd_features
                     # Denormalize images for strategy processing (ImageNet normalization)
                     mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
@@ -1038,25 +1096,45 @@ class EmbeddingTrainer:
         # Setup logging
         self._setup_logging()
 
-        # Load DINOv3 encoder
-        if self.rank == 0:
-            print(f"Loading DINOv3 encoder: {model_name}")
-        model_config = {
-            'model_name': model_name,
-            'device': self.device
-        }
-        self.encoder, self.tokenizer, self.preprocess = load_models(model_config)
-        self.intermediate_encoder = None
-        if hasattr(self.encoder, "get_intermediate_layers"):
-            self.intermediate_encoder = self.encoder
-        elif hasattr(self.encoder, "dinov2") and hasattr(self.encoder.dinov2, "get_intermediate_layers"):
-            self.intermediate_encoder = self.encoder.dinov2
-        if hasattr(self.encoder, "output_dim"):
+        # Check if running in video mode (using VideoMAEv2 model)
+        self.video_mode = "videomae" in model_name.lower() or "opengvlab" in model_name.lower() or "mcg-nju" in model_name.lower()
+
+        # Load video or image encoder
+        if self.video_mode:
+            if self.rank == 0:
+                print(f"Loading VideoMAE encoder: {model_name}")
+            from models.video_encoder_wrapper import load_video_encoder
+            self.encoder = load_video_encoder(model_name=model_name, device=self.device)
             self.feature_dim = self.encoder.output_dim
-        elif hasattr(self.encoder, "visual") and hasattr(self.encoder.visual, "output_dim"):
-            self.feature_dim = self.encoder.visual.output_dim
+            
+            class DummyTokenizer:
+                def tokenize(self, text):
+                    return torch.zeros(1, 77, dtype=torch.long)
+            self.tokenizer = DummyTokenizer()
+            self.preprocess = None
         else:
-            raise AttributeError("Encoder has no output_dim; expected model.output_dim or model.visual.output_dim")
+            if self.rank == 0:
+                print(f"Loading DINOv3 encoder: {model_name}")
+            model_config = {
+                'model_name': model_name,
+                'device': self.device
+            }
+            self.encoder, self.tokenizer, self.preprocess = load_models(model_config)
+            
+            if hasattr(self.encoder, "output_dim"):
+                self.feature_dim = self.encoder.output_dim
+            elif hasattr(self.encoder, "visual") and hasattr(self.encoder.visual, "output_dim"):
+                self.feature_dim = self.encoder.visual.output_dim
+            else:
+                raise AttributeError("Encoder has no output_dim; expected model.output_dim or model.visual.output_dim")
+
+        self.intermediate_encoder = None
+        if not self.video_mode:
+            if hasattr(self.encoder, "get_intermediate_layers"):
+                self.intermediate_encoder = self.encoder
+            elif hasattr(self.encoder, "dinov2") and hasattr(self.encoder.dinov2, "get_intermediate_layers"):
+                self.intermediate_encoder = self.encoder.dinov2
+
         if self.rank == 0:
             print(f"Feature dimension: {self.feature_dim}")
 
@@ -1065,18 +1143,27 @@ class EmbeddingTrainer:
             param.requires_grad = False
         self.encoder.eval()
 
-        # Initialize decoder using factory
+        # Initialize decoder using factory (or 3D UNet if in video mode)
         if self.rank == 0:
             print(f"Initializing {decoder_type} decoder with eps={eps}")
-            if decoder_kwargs:
-                print(f"  Decoder kwargs: {decoder_kwargs}")
+            if self.decoder_kwargs:
+                print(f"  Decoder kwargs: {self.decoder_kwargs}")
 
-        self.decoder = create_decoder(
-            model_name=model_name,
-            eps=eps,
-            decoder_type=decoder_type,
-            **decoder_kwargs
-        ).to(self.device)
+        if self.video_mode:
+            from models.unet_3d import UNetDecoder3D
+            # Video mode uses UNetDecoder3D
+            self.decoder = UNetDecoder3D(
+                embed_dim=self.feature_dim,
+                eps=eps,
+                **self.decoder_kwargs
+            ).to(self.device)
+        else:
+            self.decoder = create_decoder(
+                model_name=model_name,
+                eps=eps,
+                decoder_type=decoder_type,
+                **self.decoder_kwargs
+            ).to(self.device)
 
         # Wrap decoder with DDP if needed
         if self.is_ddp:
@@ -1435,61 +1522,79 @@ class EmbeddingTrainer:
 
         elif mode == "ensemble":
             if self.classifier is None:
-                # Use EnsembleClassifier with foundation + scratch branches
-                # Prefer explicit model_name (supports CLIP/DINOv3) over feature-dim mapping
-                encoder_name = getattr(self, "ensemble_encoder_name", None) or self.model_name
+                if self.video_mode:
+                    from rfnt_models.ensemble.video_classifier import VideoEnsembleClassifier
+                    # Get LPD channels
+                    lpd_channels = 3
+                    if self.lpd_strategy is not None:
+                        lpd_channels = self.lpd_strategy.get_output_channels() if hasattr(self.lpd_strategy, 'get_output_channels') else 3
+                    
+                    classifier = VideoEnsembleClassifier(
+                        video_encoder=self.encoder,
+                        feature_dim=self.feature_dim,
+                        lpd_channels=lpd_channels,
+                        resnet_variant="r3d_18",
+                        dropout=0.1,
+                        temperature=1.0,
+                        fusion_method=self.fusion_method,
+                        use_four_branch=self.use_four_branch_ensemble
+                    ).to(self.device)
+                else:
+                    # Use EnsembleClassifier with foundation + scratch branches
+                    # Prefer explicit model_name (supports CLIP/DINOv3) over feature-dim mapping
+                    encoder_name = getattr(self, "ensemble_encoder_name", None) or self.model_name
 
-                # Get strategy info
-                num_scales = 5  # Default for MultiScaleRaw
-                images_per_scale = 5
-                if self.strategy is not None:
-                    num_scales = len(getattr(self.strategy, 'levels', [0])) if hasattr(self.strategy, 'levels') else 5
-                    if hasattr(self.strategy, 'get_images_per_scale'):
-                        images_per_scale = self.strategy.get_images_per_scale()
+                    # Get strategy info
+                    num_scales = 5  # Default for MultiScaleRaw
+                    images_per_scale = 5
+                    if self.strategy is not None:
+                        num_scales = len(getattr(self.strategy, 'levels', [0])) if hasattr(self.strategy, 'levels') else 5
+                        if hasattr(self.strategy, 'get_images_per_scale'):
+                            images_per_scale = self.strategy.get_images_per_scale()
 
-                # Get LPD channels (only used if scratch branch is enabled)
-                lpd_channels = 3  # Default for LPD
-                if self.lpd_strategy is not None:
-                    lpd_channels = self.lpd_strategy.get_output_channels() if hasattr(self.lpd_strategy, 'get_output_channels') else 3
+                    # Get LPD channels (only used if scratch branch is enabled)
+                    lpd_channels = 3  # Default for LPD
+                    if self.lpd_strategy is not None:
+                        lpd_channels = self.lpd_strategy.get_output_channels() if hasattr(self.lpd_strategy, 'get_output_channels') else 3
 
-                # Choose 2-branch or 4-branch ensemble
-                if self.use_four_branch_ensemble:
-                    if self.lpd_strategy is None:
-                        classifier = ThreeBranchEnsembleNoLPD(
-                            encoder_name=encoder_name,
-                            num_scales=num_scales,
-                            images_per_scale=images_per_scale,
-                            feature_fusion="attention",
-                            embedding_dim=self.feature_dim,
-                            dropout=0.1,
-                            temperature=1.0,
-                            fusion_method=self.fusion_method
-                        ).to(self.device)
+                    # Choose 2-branch or 4-branch ensemble
+                    if self.use_four_branch_ensemble:
+                        if self.lpd_strategy is None:
+                            classifier = ThreeBranchEnsembleNoLPD(
+                                encoder_name=encoder_name,
+                                num_scales=num_scales,
+                                images_per_scale=images_per_scale,
+                                feature_fusion="attention",
+                                embedding_dim=self.feature_dim,
+                                dropout=0.1,
+                                temperature=1.0,
+                                fusion_method=self.fusion_method
+                            ).to(self.device)
+                        else:
+                            classifier = FourBranchEnsemble(
+                                encoder_name=encoder_name,
+                                num_scales=num_scales,
+                                images_per_scale=images_per_scale,
+                                lpd_channels=lpd_channels,
+                                resnet_variant="resnet34",
+                                feature_fusion="attention",
+                                embedding_dim=self.feature_dim,
+                                dropout=0.1,
+                                temperature=1.0,
+                                fusion_method=self.fusion_method
+                            ).to(self.device)
                     else:
-                        classifier = FourBranchEnsemble(
+                        classifier = EnsembleClassifier(
                             encoder_name=encoder_name,
                             num_scales=num_scales,
                             images_per_scale=images_per_scale,
                             lpd_channels=lpd_channels,
                             resnet_variant="resnet34",
                             feature_fusion="attention",
-                            embedding_dim=self.feature_dim,
                             dropout=0.1,
                             temperature=1.0,
                             fusion_method=self.fusion_method
                         ).to(self.device)
-                else:
-                    classifier = EnsembleClassifier(
-                        encoder_name=encoder_name,
-                        num_scales=num_scales,
-                        images_per_scale=images_per_scale,
-                        lpd_channels=lpd_channels,
-                        resnet_variant="resnet34",
-                        feature_fusion="attention",
-                        dropout=0.1,
-                        temperature=1.0,
-                        fusion_method=self.fusion_method
-                    ).to(self.device)
 
                 if self.is_ddp:
                     self.classifier = DDP(classifier, device_ids=[self.rank], find_unused_parameters=False)
@@ -1635,6 +1740,157 @@ class EmbeddingTrainer:
             # Update epsilon for this batch (for domain generalization)
             current_eps = self.get_current_eps(epoch, batch_idx, total_batches)
             self.update_decoder_eps(current_eps)
+
+            if self.video_mode:
+                # ================= VIDEO MODE =================
+                video = batch['video'].to(self.device)  # [B, T, C, H, W]
+                labels = batch.get('label', None)
+                if labels is not None:
+                    labels = labels.to(self.device).float()
+
+                # Permute for 3D Conv: [B, C, T, H, W]
+                video_c_first = video.permute(0, 2, 1, 3, 4)
+
+                # 1. Clean embedding
+                with torch.no_grad():
+                    clean_embeddings = self.encoder(video)
+
+                # 2. Generate spatiotemporal noise
+                noise = self.decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
+
+                # 3. Noisy embedding
+                perturbed_video = (video_c_first + noise).permute(0, 2, 1, 3, 4)
+                noisy_embeddings = self.encoder(perturbed_video)
+
+                # Compute cosine similarity
+                embedding_similarity = F.cosine_similarity(clean_embeddings, noisy_embeddings, dim=1)
+
+                # 4. Compute embedding loss based on loss_type
+                if self.loss_type == "similarity":
+                    embedding_loss = embedding_similarity.mean()
+                elif self.loss_type == "discrepancy":
+                    if labels is not None:
+                        mask_real = (labels == 0)
+                        mask_fake = (labels == 1)
+
+                        real_similarity = embedding_similarity[mask_real].mean() if mask_real.any() else torch.tensor(0.0, device=self.device)
+                        fake_similarity = embedding_similarity[mask_fake].mean() if mask_fake.any() else torch.tensor(0.0, device=self.device)
+
+                        if self.normalize_loss:
+                            normalized_margin = self.margin * (1 - real_similarity + 1e-6)
+                            embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / (1 - real_similarity + 1e-6)
+                        else:
+                            embedding_loss = F.relu((fake_similarity - real_similarity) + self.margin)
+                    else:
+                        embedding_loss = embedding_similarity.mean()
+                else:
+                    raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+                # Track metrics
+                total_similarity = embedding_similarity.mean().item()
+                num_real = 0
+                num_fake = 0
+                if labels is not None:
+                    num_real = (labels == 0).sum().item()
+                    num_fake = (labels == 1).sum().item()
+
+                    mask_real = (labels == 0)
+                    mask_fake = (labels == 1)
+
+                    if mask_real.any():
+                        self._last_real_similarity = embedding_similarity[mask_real].mean().item()
+                    if mask_fake.any():
+                        self._last_fake_similarity = embedding_similarity[mask_fake].mean().item()
+                else:
+                    self._last_real_similarity = 0.0
+                    self._last_fake_similarity = 0.0
+
+                # Classification loss
+                classification_loss = torch.tensor(0.0, device=self.device)
+                batch_accuracy = 0.0
+                if labels is not None and self.training_mode == "ensemble":
+                    lpd_features = None
+                    if self.lpd_strategy is not None:
+                        lpd_features = self.lpd_strategy.preprocess(video)
+
+                    inputs = {
+                        "video": video,
+                        "noise": noise,
+                        "lpd_features": lpd_features,
+                        "l2_distance": torch.norm(clean_embeddings - noisy_embeddings, p=2, dim=1, keepdim=True),
+                        "embedding_diff": clean_embeddings - noisy_embeddings
+                    }
+
+                    outputs = self.classifier(use_max_for_eval=False, **inputs)
+                    if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
+                        ensemble_logits, branch_logits = outputs
+                    else:
+                        ensemble_logits = outputs
+                        branch_logits = {"ensemble": outputs}
+
+                    labels_squeezed = labels.squeeze(-1) if labels.dim() > 1 else labels
+                    classification_loss = torch.tensor(0.0, device=self.device)
+                    for logits in branch_logits.values():
+                        classification_loss = classification_loss + self.bce_loss_fn(logits.squeeze(-1), labels_squeezed)
+
+                    cls_logits = ensemble_logits.reshape(-1)
+                    cls_probs = torch.sigmoid(cls_logits)
+                    cls_preds = (cls_probs >= 0.5).float()
+                    labels_flat = labels.reshape(-1)
+                    batch_correct = (cls_preds == labels_flat).sum().item()
+                    batch_accuracy = batch_correct / labels_flat.size(0)
+                    total_correct += batch_correct
+                    total_samples += labels_flat.size(0)
+
+                # Total Loss & Backprop
+                if self.training_mode == "ensemble":
+                    loss = embedding_loss + self.lambda_classification * classification_loss
+                else:
+                    loss = embedding_loss
+
+                self.decoder_optimizer.zero_grad()
+                if self.classifier_optimizer is not None:
+                    self.classifier_optimizer.zero_grad()
+
+                loss.backward()
+
+                self.decoder_optimizer.step()
+                if self.classifier_optimizer is not None:
+                    self.classifier_optimizer.step()
+
+                total_loss += loss.item()
+                total_emb_loss += embedding_loss.item()
+                if self.training_mode == "ensemble":
+                    total_cls_loss += classification_loss.item()
+                num_batches += 1
+
+                # Update progress bar
+                decoder_eps = self.get_decoder_eps()
+                eps_int = int(decoder_eps * 255)
+
+                if self.rank == 0 and labels is not None and (labels == 0).any() and (labels == 1).any():
+                    pbar_dict = {
+                        'loss': f'{loss.item():.4f}',
+                        'sim_r': f'{self._last_real_similarity:.4f}',
+                        'sim_f': f'{self._last_fake_similarity:.4f}',
+                        'eps': eps_int if self.eps_randomization else int(self.eps * 255),
+                    }
+                    if self.training_mode == "ensemble":
+                        pbar_dict['cls_loss'] = f'{classification_loss.item():.4f}'
+                        pbar_dict['acc'] = f'{batch_accuracy:.4f}'
+                    pbar.set_postfix(pbar_dict)
+                elif self.rank == 0:
+                    pbar_dict = {
+                        'loss': f'{loss.item():.4f}',
+                        'eps': eps_int if self.eps_randomization else int(self.eps * 255),
+                    }
+                    if self.training_mode == "ensemble" and labels is not None:
+                        pbar_dict['cls_loss'] = f'{classification_loss.item():.4f}'
+                        pbar_dict['acc'] = f'{batch_accuracy:.4f}'
+                    pbar.set_postfix(pbar_dict)
+
+                self.global_step += 1
+                continue
 
             # Handle both dict and tuple formats
             if isinstance(batch, dict):

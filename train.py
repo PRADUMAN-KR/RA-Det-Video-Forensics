@@ -8,7 +8,6 @@ Usage:
     # Multi-GPU with torchrun
     torchrun --nproc_per_node=4 train.py --config anyattack_decoder_vitl16
 
-Author: Implementation Plan
 """
 
 import os
@@ -123,8 +122,8 @@ def create_dataloaders(config, rank, world_size, strategy=None):
     """
     Create train and validation dataloaders.
 
-    Train: ProGAN training data with random crop/flip
-    Validation: AIGCTestset with center crop (no flip)
+    Train: ProGAN training data with random crop/flip (or VideoDataset for videos)
+    Validation: AIGCTestset with center crop (or VideoDataset for videos)
 
     Args:
         config: Experiment configuration
@@ -135,47 +134,66 @@ def create_dataloaders(config, rank, world_size, strategy=None):
     Returns:
         train_loader, val_loader
     """
-    # ========================================================================
-    # Training dataset: ProGAN with random augmentations
-    # ========================================================================
-    train_transform = T.Compose([
-        T.RandomCrop(size=[224, 224], pad_if_needed=True),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet stats
-    ])
+    video_mode = "videomae" in config.get('model_name', '').lower() or "opengvlab" in config.get('model_name', '').lower() or "mcg-nju" in config.get('model_name', '').lower() or config.get('video_mode', False)
 
-    # Use simple InputStrategy for dataset (returns 3-channel images)
-    # Multi-scale strategy is applied in training loop, not in dataset
-    dataset_strategy = InputStrategy()
-
-    train_dataset = ProGANTrainingDataset(
-        root_dir=config['progan_train_data_path'],
-        strategy=dataset_strategy,
-        transform=train_transform,
-        balance_classes=False
-    )
-
-    # ========================================================================
-    # Validation dataset: AIGCTestset with center crop
-    # ========================================================================
-    # AIGCTest uses CenterCrop + ImageNet normalization (same as training)
-    val_transform = T.Compose([
-        T.CenterCrop((224, 224)),
-        T.ToTensor(),
-        T.Normalize(
-            mean=[0.485, 0.456, 0.406],  # ImageNet stats
-            std=[0.229, 0.224, 0.225]
+    if video_mode:
+        from datasets.video_dataset import VideoDataset
+        
+        train_dataset = VideoDataset(
+            root_dir=config.get('video_train_data_path', config.get('progan_train_data_path')),
+            num_frames=config.get('num_frames', 16),
+            split="train",
+            balance_classes=False
         )
-    ])
+        
+        val_dataset = VideoDataset(
+            root_dir=config.get('video_val_data_path', AIGCTEST_DATA_PATH),
+            num_frames=config.get('num_frames', 16),
+            split="val",
+            balance_classes=False
+        )
+    else:
+        # ========================================================================
+        # Training dataset: ProGAN with random augmentations
+        # ========================================================================
+        train_transform = T.Compose([
+            T.RandomCrop(size=[224, 224], pad_if_needed=True),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet stats
+        ])
 
-    val_dataset = AIGCTestDataset(
-        root_dir=AIGCTEST_DATA_PATH,
-        strategy=dataset_strategy,  # Use simple InputStrategy (returns 3-channel images)
-        transform=val_transform,
-        test_generators=None,  # All generators
-        balance_test=False
-    )
+        # Use simple InputStrategy for dataset (returns 3-channel images)
+        # Multi-scale strategy is applied in training loop, not in dataset
+        dataset_strategy = InputStrategy()
+
+        train_dataset = ProGANTrainingDataset(
+            root_dir=config['progan_train_data_path'],
+            strategy=dataset_strategy,
+            transform=train_transform,
+            balance_classes=False
+        )
+
+        # ========================================================================
+        # Validation dataset: AIGCTestset with center crop
+        # ========================================================================
+        # AIGCTest uses CenterCrop + ImageNet normalization (same as training)
+        val_transform = T.Compose([
+            T.CenterCrop((224, 224)),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],  # ImageNet stats
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+        val_dataset = AIGCTestDataset(
+            root_dir=AIGCTEST_DATA_PATH,
+            strategy=dataset_strategy,  # Use simple InputStrategy (returns 3-channel images)
+            transform=val_transform,
+            test_generators=None,  # All generators
+            balance_test=False
+        )
 
     # ========================================================================
     # Create samplers for distributed training
@@ -224,17 +242,18 @@ def create_dataloaders(config, rank, world_size, strategy=None):
         print(f"  Train samples: {len(train_dataset)}")
         print(f"  Val samples: {len(val_dataset)}")
 
-        # Show validation generators
-        val_gens = val_dataset.get_generator_list()
-        print(f"  Validation generators: {val_gens}")
+        if not video_mode:
+            # Show validation generators
+            val_gens = val_dataset.get_generator_list()
+            print(f"  Validation generators: {val_gens}")
 
-        # Show stats
-        stats = val_dataset.get_stats()
-        print(f"  Val real samples: {stats['real_samples']}")
-        print(f"  Val fake samples: {stats['fake_samples']}")
-        print(f"  Generators distribution:")
-        for gen, count in stats.get('generators', {}).items():
-            print(f"    {gen}: {count}")
+            # Show stats
+            stats = val_dataset.get_stats()
+            print(f"  Val real samples: {stats['real_samples']}")
+            print(f"  Val fake samples: {stats['fake_samples']}")
+            print(f"  Generators distribution:")
+            for gen, count in stats.get('generators', {}).items():
+                print(f"    {gen}: {count}")
 
     return train_loader, val_loader
 
@@ -751,6 +770,29 @@ def main():
         default=None,
         help='Path to checkpoint to validate (skip training, only run validation)'
     )
+    parser.add_argument(
+        '--video-mode',
+        action='store_true',
+        help='Enable 3D spatiotemporal video training mode'
+    )
+    parser.add_argument(
+        '--num-frames',
+        type=int,
+        default=16,
+        help='Number of frames to sample per video sequence (default: 16)'
+    )
+    parser.add_argument(
+        '--video-train-data-path',
+        type=str,
+        default=None,
+        help='Override path for video training dataset'
+    )
+    parser.add_argument(
+        '--video-val-data-path',
+        type=str,
+        default=None,
+        help='Override path for video validation dataset'
+    )
 
     args = parser.parse_args()
 
@@ -809,6 +851,14 @@ def main():
 
     # Four-branch ensemble setting
     config['use_four_branch_ensemble'] = args.four_branch_ensemble
+
+    # Video training settings
+    config['video_mode'] = args.video_mode
+    config['num_frames'] = args.num_frames
+    if args.video_train_data_path is not None:
+        config['video_train_data_path'] = args.video_train_data_path
+    if args.video_val_data_path is not None:
+        config['video_val_data_path'] = args.video_val_data_path
 
     # Override with resume checkpoint if provided
     if args.resume:

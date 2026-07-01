@@ -14,7 +14,7 @@ set -e
 # Configuration
 ################################################################################
 
-NUM_GPUS=8
+NUM_GPUS=1
 CHECKPOINT_PATH="/mnt/shared-storage-user/chenyunhao/LeakyCLIP/ai_generated_image_detection/releases/experiment_results_reference/checkpoints/checkpoint_best.pt"
 CONFIG="ensemble_vitl16_raw_lpd_discrepancy"
 EPS_VALUE=16
@@ -62,7 +62,7 @@ echo "========================================================================"
 # Validation - uses train.py --validate-checkpoint for exact same init as training
 ################################################################################
 
-CMD="torchrun --nproc_per_node=$NUM_GPUS train.py \
+CMD="uv run torchrun --nproc_per_node=$NUM_GPUS train.py \
     --config $CONFIG \
     --eps $EPS_DECIMAL \
     --margin $MARGIN_VALUE \

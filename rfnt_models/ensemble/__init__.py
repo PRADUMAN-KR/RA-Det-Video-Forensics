@@ -51,6 +51,7 @@ from .classifier import (
     FourBranchEnsemble,
     ThreeBranchEnsembleNoLPD,
 )
+from .video_classifier import VideoEnsembleClassifier
 
 __all__ = [
     # Base classes
@@ -78,4 +79,5 @@ __all__ = [
     "BackwardCompatibleEnsemble",
     "FourBranchEnsemble",
     "ThreeBranchEnsembleNoLPD",
+    "VideoEnsembleClassifier",
 ]

@@ -12,7 +12,7 @@ set -e
 # Configuration
 ################################################################################
 
-NUM_GPUS=8
+NUM_GPUS=1
 NITER=1
 EPS_VALUE=16
 EPS_DECIMAL=0.06274509803921569
@@ -63,7 +63,7 @@ echo "========================================================================"
 
 CHECKPOINT_DIR="${EXPERIMENT_DIR}/checkpoints"
 
-CMD="torchrun --nproc_per_node=$NUM_GPUS train.py \
+CMD="uv run torchrun --nproc_per_node=$NUM_GPUS train.py \
     --config ensemble_vitl16_raw_lpd_discrepancy \
     --eps $EPS_DECIMAL \
     --margin $MARGIN_VALUE \
