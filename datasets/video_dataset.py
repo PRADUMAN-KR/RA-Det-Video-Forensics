@@ -94,9 +94,56 @@ class VideoDataset(Dataset):
 
             # Extract generator type from path parts if available
             generator = "unknown"
+            # Comprehensive list of known generators and dataset names:
+            # - Classic deepfake datasets: FaceForensics++, DFDC, CelebDF, WildDeepfake, DeeperForensics
+            # - FF++ manipulation methods: DeepFakes, Face2Face, FaceSwap, NeuralTextures, FaceShifter
+            # - GAN-based video generators: ProGAN, StyleGAN, BigGAN
+            # - Diffusion/flow-based video generators: Stable Diffusion Video, ModelScope, ZeroScope
+            # - Next-gen commercial platforms: Sora, Runway Gen-2/Gen-3, Pika, Kling, Luma Dream Machine,
+            #                                  Veo (Google), Wan (Alibaba), Hailuo, Morphic, Lightricks LTX
+            KNOWN_GENERATORS = {
+                # --- Classic Deepfake Datasets ---
+                'faceforensics', 'faceforensics++', 'ff++',
+                'dfdc', 'deepfakedetectionchallenge',
+                'celebdf', 'celeb_df', 'celeb-df',
+                'wilddeepfake', 'wild_deepfake',
+                'deeperforensics', 'deeper_forensics',
+                'fakedav', 'fake_av',
+
+                # --- FF++ Manipulation Methods ---
+                'deepfakes', 'deepfake',
+                'face2face', 'faceswap', 'face_swap',
+                'neuraltextures', 'neural_textures',
+                'faceshifter', 'face_shifter',
+
+                # --- GAN-based Generators ---
+                'progan', 'stylegan', 'stylegan2', 'biggan',
+                'stargan', 'cyclegan',
+
+                # --- Diffusion / Flow-based Video Generators ---
+                'stable_diffusion', 'stable_diffusion_video', 'sdv',
+                'modelscope', 'zeroscope', 'animatediff',
+                'opensora', 'open_sora', 'cogvideo', 'cogvideox',
+                'lavie', 'show_one', 'videocrafter',
+
+                # --- Next-Gen Commercial Platforms ---
+                'sora',                          # OpenAI Sora
+                'runway', 'gen2', 'gen3',        # Runway Gen-2 / Gen-3
+                'pika', 'pika_labs',             # Pika Labs
+                'luma', 'lumaai',                # Luma Dream Machine
+                'kling', 'klingai',              # Kuaishou Kling
+                'veo', 'veo2',                   # Google Veo
+                'wan', 'wan2',                   # Alibaba Wan
+                'hailuo', 'minimax',             # MiniMax Hailuo
+                'ltx', 'lightricks',             # Lightricks LTX-Video
+                'morphic', 'pixverse',           # Other platforms
+                'genmo', 'mochi',                # Genmo Mochi
+                'hunyuan', 'hunyuanvideo',       # Tencent HunyuanVideo
+                'step', 'stepvideo',             # Step Video
+            }
             for part in Path(dirpath).parts:
-                if part.lower() in ['progan', 'stable_diffusion', 'runway', 'sora', 'pika', 'gen2', 'luma', 'deepfake']:
-                    generator = part
+                if part.lower() in KNOWN_GENERATORS:
+                    generator = part.lower()
                     break
 
             # 1. Collect Video Files
