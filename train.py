@@ -793,6 +793,12 @@ def main():
         default=None,
         help='Override path for video validation dataset'
     )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=None,
+        help='Override batch size (default: from config)'
+    )
 
     args = parser.parse_args()
 
@@ -859,6 +865,8 @@ def main():
         config['video_train_data_path'] = args.video_train_data_path
     if args.video_val_data_path is not None:
         config['video_val_data_path'] = args.video_val_data_path
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
 
     # Override with resume checkpoint if provided
     if args.resume:

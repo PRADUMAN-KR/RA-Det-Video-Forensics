@@ -116,8 +116,7 @@ def download_kinetics400_real(dest_dir, num_videos, hf_token):
 
     for class_path in tqdm(class_dirs, desc="  Scanning classes"):
         try:
-            files = fs.ls(class_path, detail=False)
-            mp4_files = [f for f in files if f.endswith(".mp4")]
+            mp4_files = fs.glob(f"{class_path}/*/*.mp4")
             sample = random.sample(mp4_files, min(per_class, len(mp4_files)))
             all_files.extend(sample)
         except Exception:
@@ -126,28 +125,50 @@ def download_kinetics400_real(dest_dir, num_videos, hf_token):
             break
 
     random.shuffle(all_files)
+    random.shuffle(all_files)
     all_files = all_files[:num_videos]
-    print(f"  Downloading {len(all_files)} videos...")
+    print(f"  Downloading {len(all_files)} videos (Parallel)...")
 
-    downloaded, failed = 0, 0
     prefix = f"datasets/{REPO_ID}/"
-    for hf_path in tqdm(all_files, desc="  Kinetics-400"):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def download_one(hf_path):
         filename = hf_path[len(prefix):] if hf_path.startswith(prefix) else hf_path
         dest_path = os.path.join(dest_dir, os.path.basename(filename))
         if os.path.exists(dest_path):
-            downloaded += 1
-            continue
+            return True, None
         try:
             cached = hf_hub_download(
                 repo_id=REPO_ID, filename=filename, repo_type="dataset",
                 token=hf_token, cache_dir="/tmp/hf_cache",
             )
             shutil.copy2(cached, dest_path)
-            downloaded += 1
+            return True, None
         except Exception as e:
-            failed += 1
-            if failed <= 3:
-                print(f"\n  Warning: {os.path.basename(filename)}: {e}")
+            return False, str(e)
+
+    downloaded = 0
+    failed = 0
+    errors = []
+
+    # Using 24 parallel threads to mask connection latency for 50,000 small files
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        futures = {executor.submit(download_one, path): path for path in all_files}
+        with tqdm(total=len(all_files), desc="  Kinetics-400") as pbar:
+            for future in as_completed(futures):
+                success, err_msg = future.result()
+                if success:
+                    downloaded += 1
+                else:
+                    failed += 1
+                    if len(errors) < 3:
+                        errors.append(f"{os.path.basename(futures[future])}: {err_msg}")
+                pbar.update(1)
+
+    if errors:
+        print("\n  Sample errors during download:")
+        for err in errors:
+            print(f"    - {err}")
 
     print(f"\n  ✓ Real: {downloaded} videos → {dest_dir}" +
           (f" ({failed} failed)" if failed else ""))
@@ -231,6 +252,33 @@ def download_genbuster(dest_dir, num_videos, hf_token):
     shutil.rmtree(staging, ignore_errors=True)
     print(f"  ✓ GenBuster-200K: {count} videos → {dest_dir}")
     return count
+
+
+# ---------------------------------------------------------------------------
+# Fake source 1.5: GenBuster-200K-mini
+# ---------------------------------------------------------------------------
+
+def download_genbuster_mini(dest_dir, num_videos, hf_token):
+    from huggingface_hub import hf_hub_download
+    
+    _section(f"Downloading {num_videos} FAKE Videos — GenBuster-200K-mini")
+    print("  Models: Sora, WanX, Kling, CogVideo, SVD, Pika, ModelScope, VideoCrafter")
+    os.makedirs(dest_dir, exist_ok=True)
+    
+    REPO_ID = "l8cv/GenBuster-200K-mini"
+    print("\n  Fetching GenBuster-200K-mini.zip (~5.4 GB)...")
+    try:
+        zip_path = hf_hub_download(
+            repo_id=REPO_ID, filename="GenBuster-200K-mini.zip",
+            repo_type="dataset", token=hf_token, cache_dir="/tmp/hf_cache",
+        )
+    except Exception as e:
+        print(f"  ✗ GenBuster-200K-mini download failed: {e}")
+        return 0
+        
+    extracted = _extract_zip_mp4s(zip_path, dest_dir, num_videos, prefix="genbuster")
+    print(f"  ✓ GenBuster-200K-mini: {extracted} videos → {dest_dir}")
+    return extracted
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +442,8 @@ def download_fake_videos(dest_dir, num_videos, hf_token, source):
     total = 0
     if source in ("genbuster", "all"):
         total += download_genbuster(dest_dir, num_videos - total, hf_token)
+    if source in ("genbuster-mini", "all") and total < num_videos:
+        total += download_genbuster_mini(dest_dir, num_videos - total, hf_token)
     if source in ("public", "synth", "all") and total < num_videos:
         total += download_synth_vid_detect(dest_dir, num_videos - total, hf_token)
     if source in ("public", "opensora", "all") and total < num_videos:
@@ -413,8 +463,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 fake-source options:
-  genbuster  200K videos (Sora/WanX/Kling/CogVideo/SVD/Pika) — needs p7zip + token + ~108GB
+  genbuster       200K videos (Sora/WanX/Kling/CogVideo/SVD/Pika) — needs p7zip + token + ~108GB
              Accept: https://huggingface.co/datasets/l8cv/GenBuster-200K
+  genbuster-mini  ~10K subset of GenBuster (5.4GB zip). High quality, fast.
   public     ~10K total, no gating (synth-vid-detect + OpenSora zips)
   synth      Only synth-vid-detect (~10K, 7 models, public)
   opensora   Only OpenSora zips (~2-10K, public)
@@ -430,7 +481,7 @@ Recommended for VideoMAE Large (0.3B):
                         help="HuggingFace token. Required for Kinetics-400 + GenBuster-200K.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed. Default: 42")
     parser.add_argument("--fake-source", dest="fake_source",
-                        choices=["genbuster", "public", "synth", "opensora", "all"],
+                        choices=["genbuster", "genbuster-mini", "public", "synth", "opensora", "all"],
                         default="public",
                         help="Fake video source. Default: public")
     parser.add_argument("--skip-real", action="store_true", help="Skip real video download.")
