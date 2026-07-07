@@ -118,7 +118,7 @@ class InputStrategy(BaseInputStrategy):
         return "foundation"
 
 
-def create_dataloaders(config, rank, world_size, strategy=None):
+def create_dataloaders(config, rank, world_size, strategy=None, num_workers=4):
     """
     Create train and validation dataloaders.
 
@@ -223,8 +223,8 @@ def create_dataloaders(config, rank, world_size, strategy=None):
         batch_size=config['batch_size'],
         sampler=train_sampler,
         shuffle=(train_sampler is None),
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=(num_workers > 0),
         drop_last=True
     )
 
@@ -233,8 +233,8 @@ def create_dataloaders(config, rank, world_size, strategy=None):
         batch_size=config['batch_size'],
         sampler=val_sampler,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=(num_workers > 0)
     )
 
     if rank == 0:
@@ -495,7 +495,8 @@ def train(config):
             print(f"  Channels: {lpd_strategy.get_output_channels()}")
 
     # Create dataloaders
-    train_loader, val_loader = create_dataloaders(config, rank, world_size, strategy)
+    num_workers = config.get('num_workers', 4)
+    train_loader, val_loader = create_dataloaders(config, rank, world_size, strategy, num_workers=num_workers)
 
     # Get decoder configuration
     decoder_type = config.get('decoder_type', 'unet')
@@ -799,6 +800,12 @@ def main():
         default=None,
         help='Override batch size (default: from config)'
     )
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=None,
+        help='Number of DataLoader worker processes. Use 0 for restricted environments like Jenkins (default: 4)'
+    )
 
     args = parser.parse_args()
 
@@ -867,6 +874,8 @@ def main():
         config['video_val_data_path'] = args.video_val_data_path
     if args.batch_size is not None:
         config['batch_size'] = args.batch_size
+    if args.num_workers is not None:
+        config['num_workers'] = args.num_workers
 
     # Override with resume checkpoint if provided
     if args.resume:

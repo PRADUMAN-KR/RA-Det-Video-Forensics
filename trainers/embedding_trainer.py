@@ -657,14 +657,19 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                 )
 
                 if is_video:
-                    lpd_features = None
-                    if lpd_strategy is not None:
-                        lpd_features = lpd_strategy.preprocess(video)
+                    # NOTE: LPD is 2D-only; skip in video mode
+                    # Compute temporal difference frames [B, C, T, H, W]
+                    frame_diffs = video[:, 1:] - video[:, :-1]                          # [B, T-1, C, H, W]
+                    frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)  # [B, T,   C, H, W]
+                    temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous()    # [B, C, T, H, W]
+                    td_max = temporal_diff.abs().amax(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
+                    temporal_diff = temporal_diff / td_max
 
                     inputs = {
                         "video": video,
                         "noise": noise,
-                        "lpd_features": lpd_features,
+                        "temporal_diff": temporal_diff,
+                        "lpd_features": None,
                         "l2_distance": l2_dist.unsqueeze(1),
                         "embedding_diff": clean_embeddings - noisy_embeddings
                     }
@@ -1047,6 +1052,10 @@ class EmbeddingTrainer:
         self.rank = rank
         self.world_size = world_size
         self.is_ddp = world_size > 1
+        
+        # Check if running in video mode (using VideoMAEv2 model)
+        self.video_mode = "videomae" in model_name.lower() or "opengvlab" in model_name.lower() or "mcg-nju" in model_name.lower()
+
         self.decoder_type = decoder_type
         self.decoder_kwargs = decoder_kwargs or {}
         self.strategy = strategy
@@ -1074,8 +1083,13 @@ class EmbeddingTrainer:
         # Noise+embedding classifier L2 branch option
         self.noise_embedding_use_l2 = noise_embedding_use_l2
 
-        # Ensure decoder multiscale inputs are disabled when requested
-        if self.decoder_type == "unet" and not self.use_multi_scale_decoder:
+        # Ensure decoder multiscale inputs are disabled when requested or in video mode
+        if self.video_mode:
+            if self.decoder_kwargs.get("strategy_channels", 0) != 0:
+                if self.rank == 0:
+                    print("Video mode: disabling decoder multi-scale inputs (setting strategy_channels=0)")
+                self.decoder_kwargs["strategy_channels"] = 0
+        elif self.decoder_type == "unet" and not self.use_multi_scale_decoder:
             if self.decoder_kwargs.get("strategy_channels", 0) != 0:
                 if self.rank == 0:
                     print("Disabling decoder multi-scale inputs: setting strategy_channels=0")
@@ -1218,7 +1232,6 @@ class EmbeddingTrainer:
             self.log_file = open(log_filepath, 'a', buffering=1)  # Line buffering
             self.original_stdout = sys.stdout
 
-            # Create custom stdout that writes to both console and file
             class TeeOutput:
                 def __init__(self, original_stdout, log_file):
                     self.original_stdout = original_stdout
@@ -1231,6 +1244,12 @@ class EmbeddingTrainer:
                 def flush(self):
                     self.original_stdout.flush()
                     self.log_file.flush()
+
+                def isatty(self):
+                    return hasattr(self.original_stdout, 'isatty') and self.original_stdout.isatty()
+
+                def __getattr__(self, name):
+                    return getattr(self.original_stdout, name)
 
             sys.stdout = TeeOutput(self.original_stdout, self.log_file)
 
@@ -1521,18 +1540,20 @@ class EmbeddingTrainer:
                     print(f"  Classifier optimizer: AdamW(lr={self.lr}, wd={self.weight_decay})")
 
         elif mode == "ensemble":
+            lpd_channels = 3
+            if self.lpd_strategy is not None:
+                lpd_channels = self.lpd_strategy.get_output_channels() if hasattr(self.lpd_strategy, 'get_output_channels') else 3
+            encoder_name = getattr(self, "ensemble_encoder_name", None) or self.model_name
+
             if self.classifier is None:
                 if self.video_mode:
                     from rfnt_models.ensemble.video_classifier import VideoEnsembleClassifier
-                    # Get LPD channels
-                    lpd_channels = 3
-                    if self.lpd_strategy is not None:
-                        lpd_channels = self.lpd_strategy.get_output_channels() if hasattr(self.lpd_strategy, 'get_output_channels') else 3
                     
                     classifier = VideoEnsembleClassifier(
                         video_encoder=self.encoder,
                         feature_dim=self.feature_dim,
-                        lpd_channels=lpd_channels,
+                        lpd_channels=0,
+                        temporal_diff_channels=3,
                         resnet_variant="r3d_18",
                         dropout=0.1,
                         temperature=1.0,
@@ -1731,10 +1752,14 @@ class EmbeddingTrainer:
         num_real = 0
         num_fake = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=self.rank != 0)
+        disable_tqdm = (self.rank != 0) or (os.environ.get("TQDM_DISABLE", "0") == "1")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=disable_tqdm)
 
         # Get total number of batches for epsilon scheduling
         total_batches = len(train_loader)
+
+        if self.rank == 0:
+            print(f"Beginning Epoch {epoch}: training loop started. Total batches: {total_batches}", flush=True)
 
         for batch_idx, batch in enumerate(pbar):
             # Update epsilon for this batch (for domain generalization)
@@ -1809,13 +1834,22 @@ class EmbeddingTrainer:
                 classification_loss = torch.tensor(0.0, device=self.device)
                 batch_accuracy = 0.0
                 if labels is not None and self.training_mode == "ensemble":
+                    # NOTE: LPD strategy is 2D-only; skip it in video mode to avoid channel mismatch
                     lpd_features = None
-                    if self.lpd_strategy is not None:
-                        lpd_features = self.lpd_strategy.preprocess(video)
+
+                    # Compute temporal difference frames: captures motion inconsistencies in AI-generated video
+                    # video is [B, T, C, H, W]; diff across T dim, pad last frame to keep T consistent
+                    frame_diffs = video[:, 1:] - video[:, :-1]                      # [B, T-1, C, H, W]
+                    frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)  # [B, T,   C, H, W]
+                    temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous() # [B, C, T, H, W]
+                    # Normalise to [-1, 1] for stable gradients
+                    td_max = temporal_diff.abs().amax(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
+                    temporal_diff = temporal_diff / td_max
 
                     inputs = {
                         "video": video,
                         "noise": noise,
+                        "temporal_diff": temporal_diff,
                         "lpd_features": lpd_features,
                         "l2_distance": torch.norm(clean_embeddings - noisy_embeddings, p=2, dim=1, keepdim=True),
                         "embedding_diff": clean_embeddings - noisy_embeddings
@@ -1888,6 +1922,15 @@ class EmbeddingTrainer:
                         pbar_dict['cls_loss'] = f'{classification_loss.item():.4f}'
                         pbar_dict['acc'] = f'{batch_accuracy:.4f}'
                     pbar.set_postfix(pbar_dict)
+
+                # Print periodic progress to stdout/log file (especially important for non-TTY/Jenkins logging)
+                if self.rank == 0 and batch_idx % 10 == 0:
+                    log_str = f"Epoch {epoch} | Batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f}"
+                    if labels is not None and (labels == 0).any() and (labels == 1).any():
+                        log_str += f" | sim_r: {self._last_real_similarity:.4f} | sim_f: {self._last_fake_similarity:.4f}"
+                    if self.training_mode == "ensemble" and labels is not None:
+                        log_str += f" | cls_loss: {classification_loss.item():.4f} | acc: {batch_accuracy:.4f}"
+                    print(log_str, flush=True)
 
                 self.global_step += 1
                 continue

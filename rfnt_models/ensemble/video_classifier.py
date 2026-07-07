@@ -85,29 +85,43 @@ class VideoScratchBranch(BaseBranch):
 
     def forward(self, **kwargs) -> torch.Tensor:
         noise = kwargs.get("noise")
+        temporal_diff = kwargs.get("temporal_diff")  # [B, C, T, H, W] frame-to-frame delta
         lpd_features = kwargs.get("lpd_features")
-        
-        if noise is None or lpd_features is None:
-            raise ValueError("VideoScratchBranch requires both 'noise' and 'lpd_features' input tensors")
-            
-        # Concatenate along channel dimension: [B, C_noise + C_lpd, T, H, W]
-        x = torch.cat([noise, lpd_features], dim=1)
+
+        if noise is None:
+            raise ValueError("VideoScratchBranch requires 'noise' input tensor")
+
+        parts = [noise]
+        if temporal_diff is not None:
+            parts.append(temporal_diff)
+        if lpd_features is not None:
+            parts.append(lpd_features)
+
+        # Concatenate all available signals along channel dim: [B, C_total, T, H, W]
+        x = torch.cat(parts, dim=1)
         logits = self.model(x)
         return logits.reshape(-1, 1)
 
     def get_input_keys(self) -> List[str]:
-        return ["noise", "lpd_features"]
+        return ["noise", "temporal_diff", "lpd_features"]
 
 
 class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
     """
     Video Ensemble Classifier combining foundation, scratch, and difference branches in 3D.
+
+    Branches:
+      1. Foundation: frozen VideoMAE + trainable MLP classifier head.
+      2. Scratch:    R3D-18 3D CNN trained from scratch on noise + temporal diffs.
+      3. L2Distance:  MLP on L2 norm of (clean_emb - noisy_emb).
+      4. EmbeddingDiff: MLP on element-wise (clean_emb - noisy_emb) vector.
     """
 
     def __init__(self,
                  video_encoder: nn.Module,
                  feature_dim: int = 1024,
-                 lpd_channels: int = 3,
+                 lpd_channels: int = 0,
+                 temporal_diff_channels: int = 3,
                  resnet_variant: str = "r3d_18",
                  dropout: float = 0.1,
                  temperature: float = 1.0,
@@ -118,6 +132,7 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
         self.video_encoder = video_encoder
         self.feature_dim = feature_dim
         self.use_four_branch = use_four_branch
+        self.temporal_diff_channels = temporal_diff_channels
 
         # 1. Foundation Branch (VideoMAE + MLP)
         foundation_branch = VideoFoundationBranch(
@@ -129,11 +144,12 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
         )
         self.register_branch(foundation_branch)
 
-        # 2. Scratch Branch (ResNet3D on noise + LPD)
-        # Input channels = 3 (perturbation noise) + lpd_channels (typically 3) = 6
+        # 2. Scratch Branch (ResNet3D on noise + temporal_diff + optional LPD)
+        # Total channels = 3 (noise) + temporal_diff_channels (3) + lpd_channels (0 in video mode)
+        scratch_input_channels = 3 + temporal_diff_channels + (lpd_channels if lpd_channels > 0 else 0)
         scratch_branch = VideoScratchBranch(
             name="scratch",
-            input_channels=3 + lpd_channels,
+            input_channels=scratch_input_channels,
             architecture=resnet_variant,
             num_classes=1
         )
@@ -160,22 +176,32 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
     def forward(self,
                 video: torch.Tensor,
                 noise: torch.Tensor,
-                lpd_features: torch.Tensor,
+                temporal_diff: torch.Tensor,
+                lpd_features: Optional[torch.Tensor] = None,
                 l2_distance: Optional[torch.Tensor] = None,
                 embedding_diff: Optional[torch.Tensor] = None,
                 use_max_for_eval: bool = False,
                 **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Overridden forward to run the generic FlexibleEnsembleClassifier routing.
+
+        Args:
+            video:          [B, T, C, H, W]  - original video frames (T-first for VideoMAE).
+            noise:          [B, C, T, H, W]  - 3D UNet adversarial noise.
+            temporal_diff:  [B, C, T, H, W]  - frame-to-frame difference (motion signal).
+            lpd_features:   [B, C, T, H, W]  - optional, 2D-LPD features (None in video mode).
+            l2_distance:    [B, 1]           - L2 norm of embedding delta.
+            embedding_diff: [B, D]           - element-wise embedding delta.
         """
         inputs = {
             "video": video,
             "noise": noise,
+            "temporal_diff": temporal_diff,
             "lpd_features": lpd_features,
             "l2_distance": l2_distance,
             "embedding_diff": embedding_diff
         }
-        
+
         # Route to base implementation
         return super().forward(
             return_all_logits=True,

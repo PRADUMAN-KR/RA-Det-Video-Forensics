@@ -18,7 +18,8 @@ import torchvision.transforms as T
 try:
     import decord
     decord.bridge.set_bridge('torch')
-    DECORD_AVAILABLE = True
+    # Force disable decord due to known deadlock/hang issues inside PyTorch DataLoader threads
+    DECORD_AVAILABLE = False
 except ImportError:
     DECORD_AVAILABLE = False
 

@@ -59,6 +59,10 @@ try:
 except Exception:
     pass
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+HF_CACHE_DIR = os.path.join(PROJECT_ROOT, "data", ".hf_cache")
+
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
 # ---------------------------------------------------------------------------
@@ -140,7 +144,7 @@ def download_kinetics400_real(dest_dir, num_videos, hf_token):
         try:
             cached = hf_hub_download(
                 repo_id=REPO_ID, filename=filename, repo_type="dataset",
-                token=hf_token, cache_dir="/tmp/hf_cache",
+                token=hf_token, cache_dir=HF_CACHE_DIR,
             )
             shutil.copy2(cached, dest_path)
             return True, None
@@ -216,7 +220,7 @@ def download_genbuster(dest_dir, num_videos, hf_token):
         try:
             cached = hf_hub_download(
                 repo_id=REPO_ID, filename=part_name, repo_type="dataset",
-                token=hf_token, cache_dir="/tmp/hf_cache",
+                token=hf_token, cache_dir=HF_CACHE_DIR,
             )
             shutil.copy2(cached, part_path)
         except Exception as e:
@@ -270,7 +274,7 @@ def download_genbuster_mini(dest_dir, num_videos, hf_token):
     try:
         zip_path = hf_hub_download(
             repo_id=REPO_ID, filename="GenBuster-200K-mini.zip",
-            repo_type="dataset", token=hf_token, cache_dir="/tmp/hf_cache",
+            repo_type="dataset", token=hf_token, cache_dir=HF_CACHE_DIR,
         )
     except Exception as e:
         print(f"  ✗ GenBuster-200K-mini download failed: {e}")
@@ -335,7 +339,7 @@ def download_synth_vid_detect(dest_dir, num_videos, hf_token=None):
         try:
             cached = hf_hub_download(
                 repo_id=REPO_ID, filename=filename, repo_type="dataset",
-                token=hf_token, cache_dir="/tmp/hf_cache",
+                token=hf_token, cache_dir=HF_CACHE_DIR,
             )
             shutil.copy2(cached, dest_path)
             downloaded += 1
@@ -376,7 +380,7 @@ def download_opensora_zips(dest_dir, num_videos, hf_token=None):
         try:
             zip_path = hf_hub_download(
                 repo_id=cfg["repo_id"], filename=cfg["filename"],
-                repo_type="dataset", token=hf_token, cache_dir="/tmp/hf_cache",
+                repo_type="dataset", token=hf_token, cache_dir=HF_CACHE_DIR,
             )
         except Exception as e:
             print(f"  ✗ {cfg['label']}: {e}")
