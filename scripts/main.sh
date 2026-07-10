@@ -26,6 +26,8 @@ EXPERIMENT_DIR="${WORK_DIR}/experiment_results"
 # Parse Arguments
 ################################################################################
 
+RESUME_PATH=""
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --gpus)
@@ -34,6 +36,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --niter)
             NITER="$2"
+            shift 2
+            ;;
+        --resume)
+            RESUME_PATH="$2"
             shift 2
             ;;
         *)
@@ -54,6 +60,7 @@ echo "LOSS NORMALIZATION TRAINING"
 echo "========================================================================"
 echo "Num GPUs:       $NUM_GPUS"
 echo "Iterations:     $NITER"
+echo "Resume Path:    $RESUME_PATH"
 echo "Output Dir:     $EXPERIMENT_DIR"
 echo "========================================================================"
 
@@ -71,6 +78,10 @@ CMD="uv run torchrun --nproc_per_node=$NUM_GPUS train.py \
     --checkpoint-dir \"$CHECKPOINT_DIR\" \
     --four-branch-ensemble \
     --normalize-loss"
+
+if [ -n "$RESUME_PATH" ]; then
+    CMD="$CMD --resume \"$RESUME_PATH\""
+fi
 
 echo "Running: $CMD"
 eval "$CMD 2>&1 | tee \"${EXPERIMENT_DIR}/training.log\""

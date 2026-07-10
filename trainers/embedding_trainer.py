@@ -1924,7 +1924,7 @@ class EmbeddingTrainer:
                     pbar.set_postfix(pbar_dict)
 
                 # Print periodic progress to stdout/log file (especially important for non-TTY/Jenkins logging)
-                if self.rank == 0 and batch_idx % 10 == 0:
+                if self.rank == 0 and batch_idx % 50 == 0:
                     log_str = f"Epoch {epoch} | Batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f}"
                     if labels is not None and (labels == 0).any() and (labels == 1).any():
                         log_str += f" | sim_r: {self._last_real_similarity:.4f} | sim_f: {self._last_fake_similarity:.4f}"
@@ -2428,6 +2428,7 @@ class EmbeddingTrainer:
             'decoder_optimizer_state_dict': self.decoder_optimizer.state_dict(),
             'training_mode': getattr(self, 'training_mode', 'embedding_only'),
             'lambda_classification': getattr(self, 'lambda_classification', 0.0),
+            'best_val_similarity': getattr(self, 'best_val_similarity', float('inf')),
         }
 
         if self.classifier is not None:
@@ -2459,6 +2460,7 @@ class EmbeddingTrainer:
 
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
+        self.best_val_similarity = checkpoint.get('best_val_similarity', float('inf'))
 
         if 'classifier_state_dict' in checkpoint and self.classifier is not None:
             classifier_state = checkpoint['classifier_state_dict']

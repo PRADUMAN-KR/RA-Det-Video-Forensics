@@ -544,19 +544,23 @@ def train(config):
 
     # Resume from checkpoint if specified
     start_epoch = 1
+    best_val_similarity = float('inf')  # Lower is better (we want to minimize similarity)
     if config.get('resume_checkpoint'):
         trainer.load_checkpoint(config['resume_checkpoint'])
         start_epoch = trainer.current_epoch + 1
+        best_val_similarity = getattr(trainer, 'best_val_similarity', float('inf'))
 
     # Training loop
     niter = config['niter']
-    save_every = config.get('save_every', 5)
+    save_every = config.get('save_every', 1)
+    patience = config.get('patience', 10)
+    patience_counter = 0
 
     if rank == 0:
         print(f"\nStarting training for {niter} epochs...")
         print(f"Save checkpoint every {save_every} epochs")
+        print(f"Early stopping patience: {patience} epochs")
 
-    best_val_similarity = float('inf')  # Lower is better (we want to minimize similarity)
     train_metrics = {}
     val_metrics = {}
 
@@ -586,13 +590,28 @@ def train(config):
         if epoch % save_every == 0:
             trainer.save_checkpoint(epoch)
 
-        # Save best model
+        # Save best model and check early stopping
         if rank == 0:
             current_val_similarity = val_metrics.get('val/similarity', float('inf'))
             if current_val_similarity < best_val_similarity:
                 best_val_similarity = current_val_similarity
+                trainer.best_val_similarity = best_val_similarity
                 trainer.save_checkpoint(epoch, filename="checkpoint_best.pt")
                 print(f"  New best model saved! (similarity: {best_val_similarity:.4f})")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"  No improvement in validation similarity for {patience_counter} epochs.")
+
+        # Broadcast early stopping decision in DDP
+        early_stop = torch.tensor(1.0 if (rank == 0 and patience_counter >= patience) else 0.0, device=device)
+        if dist.is_initialized():
+            dist.broadcast(early_stop, src=0)
+
+        if early_stop.item() > 0.5:
+            if rank == 0:
+                print(f"  Early stopping triggered after {epoch} epochs (patience={patience}).")
+            break
 
     if rank == 0:
         print("\nTraining completed!")

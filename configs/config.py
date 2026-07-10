@@ -71,7 +71,7 @@ EXPERIMENT_CONFIGS = {
         "margin": 1,
 
         "checkpoint_dir": "./checkpoints/ensemble_vitl16_raw_lpd_discrepancy",
-        "save_every": 5,
+        "save_every": 1,
     },
 }
 

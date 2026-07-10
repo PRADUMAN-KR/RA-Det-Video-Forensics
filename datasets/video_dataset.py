@@ -223,21 +223,31 @@ class VideoDataset(Dataset):
     def _load_video_pyav(self, video_path: str) -> torch.Tensor:
         """Loads video file using PyAV fallback."""
         container = av.open(video_path)
-        frames_list = []
-        for frame in container.decode(video=0):
-            img = frame.to_image()
-            frames_list.append(self.transform(img))
-            
-        container.close()
         
-        # Subsample indices
-        total_frames = len(frames_list)
+        # Decode and store raw frames first to avoid processing unused frames
+        raw_frames = []
+        try:
+            for frame in container.decode(video=0):
+                raw_frames.append(frame)
+        except Exception:
+            # Ignore decoder issues at the end of the video stream
+            pass
+        finally:
+            container.close()
+            
+        total_frames = len(raw_frames)
         if total_frames == 0:
             raise ValueError(f"No frames could be decoded from video: {video_path}")
             
+        # Sample T frame indices uniformly
         indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
-        selected_frames = [frames_list[i] for i in indices]
         
+        # Only process (convert to PIL image and apply transforms) the selected frames
+        selected_frames = []
+        for i in indices:
+            img = raw_frames[i].to_image()
+            selected_frames.append(self.transform(img))
+            
         return torch.stack(selected_frames, dim=0) # [T, C, H, W]
 
     def _load_folder_frames(self, folder_path: str) -> torch.Tensor:
@@ -287,6 +297,10 @@ class VideoDataset(Dataset):
             'generator': generator,
             'path': path
         }
+
+    def get_generator_list(self) -> list:
+        """Get list of all unique generators in the dataset"""
+        return list(set(s['generator'] for s in self.samples))
 
 
 if __name__ == "__main__":
