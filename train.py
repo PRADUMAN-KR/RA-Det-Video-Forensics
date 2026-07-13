@@ -218,15 +218,37 @@ def create_dataloaders(config, rank, world_size, strategy=None, num_workers=4):
     # ========================================================================
     # Create dataloaders
     # ========================================================================
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=num_workers,
-        pin_memory=(num_workers > 0),
-        drop_last=True
-    )
+    if video_mode and world_size == 1:
+        # For single-GPU video training, use BalancedVideoSampler to guarantee
+        # every batch contains exactly batch_size//2 real + batch_size//2 fake samples.
+        # This is essential for the discrepancy loss (requires both classes per batch)
+        # and especially important at batch_size=2 where random sampling produces
+        # ~50% single-class batches.
+        from datasets.balanced_sampler import BalancedVideoSampler
+        balanced_sampler = BalancedVideoSampler(
+            train_dataset,
+            batch_size=config['batch_size'],
+            drop_last=True,
+            seed=42
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=balanced_sampler,   # batch_sampler provides complete batches
+            num_workers=num_workers,
+            pin_memory=(num_workers > 0),
+        )
+        # Attach sampler for set_epoch() calls in the training loop
+        train_loader.balanced_sampler = balanced_sampler
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=num_workers,
+            pin_memory=(num_workers > 0),
+            drop_last=True
+        )
 
     val_loader = DataLoader(
         val_dataset,
@@ -572,6 +594,10 @@ def train(config):
 
         # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
+
+        # Update epoch seed for BalancedVideoSampler (single-GPU video mode)
+        if hasattr(train_loader, 'balanced_sampler'):
+            train_loader.balanced_sampler.set_epoch(epoch)
 
         if rank == 0:
             print(f"\nTrain metrics:")

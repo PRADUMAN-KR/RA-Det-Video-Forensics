@@ -31,14 +31,16 @@ class VideoFoundationBranch(BaseBranch):
         self.video_encoder = video_encoder
         self.feature_dim = feature_dim
         
-        # Build classifier head on top of spatiotemporal embeddings
+        # Build classifier head on top of spatiotemporal embeddings.
+        # Use LayerNorm instead of BatchNorm1d: video training often runs at B=1
+        # or B=2 (VRAM-limited), where BatchNorm1d produces unstable/wrong statistics.
         layers = []
         prev_dim = feature_dim
         for h_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, h_dim),
-                nn.BatchNorm1d(h_dim),
-                nn.ReLU(),
+                nn.LayerNorm(h_dim),      # Works for any batch size including B=1
+                nn.GELU(),
                 nn.Dropout(dropout)
             ])
             prev_dim = h_dim
@@ -50,12 +52,15 @@ class VideoFoundationBranch(BaseBranch):
         video = kwargs.get("video")
         if video is None:
             raise ValueError("VideoFoundationBranch requires 'video' input tensor")
-            
-        # Get video embeddings from preloaded wrapper
-        # Encoder is evaluated under no_grad since it's frozen
-        with torch.no_grad():
-            features = self.video_encoder(video)
-            
+
+        # CRITICAL: Do NOT use torch.no_grad() here.
+        # The VideoMAE encoder parameters are frozen (requires_grad=False) so they
+        # will never accumulate or apply gradients. However, gradients must still
+        # FLOW THROUGH the frozen encoder's computation graph so that BCE loss can
+        # reach and update the trainable MLP classifier head below.
+        # Wrapping in no_grad() severs this path entirely, making the MLP untrainable.
+        features = self.video_encoder(video)
+
         logits = self.classifier(features)
         return logits.reshape(-1, 1)
 

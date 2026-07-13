@@ -60,12 +60,15 @@ class VideoDataset(Dataset):
         self.split = split
         self.balance_classes = balance_classes
 
-        # Default transforms matching VideoMAE expected resolution of 224x224
+        # Default transforms matching VideoMAE expected resolution and normalization.
+        # VideoMAE was pretrained with mean=[0.5, 0.5, 0.5] std=[0.5, 0.5, 0.5],
+        # NOT ImageNet statistics. Using ImageNet stats shifts the input distribution
+        # and degrades embedding quality.
         if transform is None:
             self.transform = T.Compose([
                 T.Resize((224, 224)),
                 T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # VideoMAE pretraining stats
             ])
         else:
             self.transform = transform

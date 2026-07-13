@@ -39,30 +39,33 @@ class VideoMAEWrapper(nn.Module):
     def encode_video(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
         Encode video frames to spatiotemporal embeddings.
-        
+
         Args:
-            video_tensor: Video tensor of shape [B, T, C, H, W] 
+            video_tensor: Video tensor of shape [B, T, C, H, W]
                          where T is sequence length (number of frames).
                          Values should be normalized.
-                         
+
         Returns:
             embeddings: Video level embeddings of shape [B, D].
         """
-        # Ensure correct input shape: [B, T, C, H, W]
-        assert video_tensor.dim() == 5, f"Expected 5D video tensor [B, T, C, H, W], got {video_tensor.dim()}D"
-        
-        # Check if gradients are required (e.g. during training for perturbation updates)
-        requires_grad = video_tensor.requires_grad or any(p.requires_grad for p in self.model.parameters())
-        
-        if requires_grad:
-            outputs = self.model(pixel_values=video_tensor)
-            # Take mean pooling over all sequence tokens to get a global video embedding
-            features = outputs.last_hidden_state.mean(dim=1)
-        else:
-            with torch.no_grad():
-                outputs = self.model(pixel_values=video_tensor)
-                features = outputs.last_hidden_state.mean(dim=1)
-                
+        assert video_tensor.dim() == 5, f"Expected 5D [B, T, C, H, W], got {video_tensor.dim()}D"
+
+        # IMPORTANT: Do NOT gate on requires_grad here.
+        #
+        # The old check — `requires_grad = tensor.requires_grad or any(p.requires_grad ...)`
+        # — always evaluates False in video mode because:
+        #   (a) DataLoader tensors have requires_grad=False by default, and
+        #   (b) the encoder is fully frozen (all params have requires_grad=False).
+        # This caused the no_grad branch to be taken unconditionally, severing the
+        # gradient path from the decoder output through this encoder to any
+        # downstream trainable module (MLP classification heads, etc.).
+        #
+        # Frozen params will never accumulate or apply gradients regardless.
+        # We simply let PyTorch autograd decide what to compute — if an outer
+        # torch.no_grad() context is active (e.g. during validation), it will
+        # suppress gradient computation automatically.
+        outputs = self.model(pixel_values=video_tensor)
+        features = outputs.last_hidden_state.mean(dim=1)
         return features.float()
 
     def forward(self, video_tensor: torch.Tensor) -> torch.Tensor:

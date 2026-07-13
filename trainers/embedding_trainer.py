@@ -1802,10 +1802,31 @@ class EmbeddingTrainer:
                         fake_similarity = embedding_similarity[mask_fake].mean() if mask_fake.any() else torch.tensor(0.0, device=self.device)
 
                         if self.normalize_loss:
-                            normalized_margin = self.margin * (1 - real_similarity + 1e-6)
-                            embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / (1 - real_similarity + 1e-6)
+                            # BUG FIX: VideoMAE produces real_similarity ≈ 0.99, making
+                            # normalized_margin = margin × (1 - 0.99) = 0.001 — trivially
+                            # satisfied, so embedding_loss was always 0 throughout training.
+                            # Floor at 0.05 to guarantee a meaningful minimum margin even
+                            # when the encoder's embedding space is very tight (cosine sim → 1).
+                            min_margin_floor = 0.05
+                            scale = (1 - real_similarity + 1e-6).clamp(min=min_margin_floor)
+                            normalized_margin = self.margin * scale
+                            embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / scale
                         else:
                             embedding_loss = F.relu((fake_similarity - real_similarity) + self.margin)
+
+                        # Gradient kickstart when both similarities are near 1.0.
+                        # Cosine similarity has near-zero gradient at the poles. Use L1
+                        # distance to inject a gradient signal and pull fake embeddings away.
+                        # Use dimension-normalised L1 to stay scale-invariant across encoders:
+                        # VideoMAE-Large is 1024-dim, so raw L1 ≈ 20-30× larger than CLIP/DINOv3.
+                        # A fixed coefficient of 0.1 made the term dominate and produce
+                        # negative total losses. Normalise by embedding dimension instead.
+                        if fake_similarity > 0.99 and mask_fake.any():
+                            emb_dim = float(clean_embeddings.shape[-1])
+                            l1_kickstart = F.pairwise_distance(
+                                clean_embeddings[mask_fake], noisy_embeddings[mask_fake], p=1
+                            ).mean() / emb_dim   # Per-dimension L1: always in [0, 2] range
+                            embedding_loss = embedding_loss - 0.5 * l1_kickstart
                     else:
                         embedding_loss = embedding_similarity.mean()
                 else:
@@ -1842,9 +1863,13 @@ class EmbeddingTrainer:
                     frame_diffs = video[:, 1:] - video[:, :-1]                      # [B, T-1, C, H, W]
                     frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)  # [B, T,   C, H, W]
                     temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous() # [B, C, T, H, W]
-                    # Normalise to [-1, 1] for stable gradients
-                    td_max = temporal_diff.abs().amax(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
-                    temporal_diff = temporal_diff / td_max
+                    # Normalise temporal difference to [-1, 1] for stable gradients.
+                    # Use 3-sigma normalisation instead of max-normalisation:
+                    # max-normalisation amplifies noise to ±1 for near-static clips
+                    # (common in Kinetics-400) where td_max ≈ 1e-6. 3-sigma is robust
+                    # to any motion magnitude and produces well-scaled features.
+                    td_std = temporal_diff.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-4)
+                    temporal_diff = (temporal_diff / (3.0 * td_std)).clamp(-1.0, 1.0)
 
                     inputs = {
                         "video": video,
@@ -1864,8 +1889,14 @@ class EmbeddingTrainer:
 
                     labels_squeezed = labels.squeeze(-1) if labels.dim() > 1 else labels
                     classification_loss = torch.tensor(0.0, device=self.device)
+                    num_branches = len(branch_logits)
                     for logits in branch_logits.values():
                         classification_loss = classification_loss + self.bce_loss_fn(logits.squeeze(-1), labels_squeezed)
+                    # Normalise by branch count so cls_loss always reflects a single-branch-equivalent BCE.
+                    # Without this, 4 branches produce cls_loss ≈ 4×0.693 = 2.77 at chance,
+                    # which overwhelms embedding_loss and makes the loss signal uninterpretable.
+                    if num_branches > 0:
+                        classification_loss = classification_loss / num_branches
 
                     cls_logits = ensemble_logits.reshape(-1)
                     cls_probs = torch.sigmoid(cls_logits)
@@ -2028,6 +2059,12 @@ class EmbeddingTrainer:
                         embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / (1 - real_similarity + 1e-6)
                     else:
                         embedding_loss = F.relu((fake_similarity - real_similarity) + self.margin)
+
+                    # Provide a gradient kickstart if similarities are stuck at the peak (> 0.99)
+                    # Cosine similarity has zero derivative at 1.0. We use L1 distance to kickstart gradients.
+                    if fake_similarity > 0.99 and mask_fake.any():
+                        l1_kickstart = F.pairwise_distance(clean_embeddings[mask_fake], noisy_embeddings[mask_fake], p=1).mean()
+                        embedding_loss = embedding_loss - 0.01 * l1_kickstart
                 else:
                     # Fallback to simple similarity if no labels
                     embedding_loss = embedding_similarity.mean()
