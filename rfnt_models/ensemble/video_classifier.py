@@ -111,6 +111,39 @@ class VideoScratchBranch(BaseBranch):
         return ["noise", "temporal_diff", "lpd_features"]
 
 
+class VideoNPRBranch(BaseBranch):
+    """
+    NPR Branch that takes precomputed NPR features [B, 48] and runs a small MLP.
+    """
+    def __init__(self, name: str = "npr", input_dim: int = 48, hidden_dims: List[int] = None, dropout: float = 0.1):
+        super().__init__(name)
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
+            
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, **kwargs) -> torch.Tensor:
+        npr_features = kwargs.get("npr_features")
+        if npr_features is None:
+            raise ValueError("VideoNPRBranch requires 'npr_features' input tensor")
+        return self.mlp(npr_features)
+
+    def get_input_keys(self) -> List[str]:
+        return ["npr_features"]
+
+
 class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
     """
     Video Ensemble Classifier combining foundation, scratch, and difference branches in 3D.
@@ -131,7 +164,8 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                  dropout: float = 0.1,
                  temperature: float = 1.0,
                  fusion_method: str = "logit_weighted",
-                 use_four_branch: bool = True):
+                 use_four_branch: bool = True,
+                 use_npr_branch: bool = False):
         super().__init__(fusion_method=fusion_method, temperature=temperature)
         
         self.video_encoder = video_encoder
@@ -178,6 +212,16 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             )
             self.register_branch(diff_branch)
 
+        if use_npr_branch:
+            # 5. NPR Branch (MLP on NPR pixel relation features)
+            npr_branch = VideoNPRBranch(
+                name="npr",
+                input_dim=48,
+                hidden_dims=[128, 64],
+                dropout=dropout
+            )
+            self.register_branch(npr_branch)
+
     def forward(self,
                 video: torch.Tensor,
                 noise: torch.Tensor,
@@ -185,6 +229,7 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                 lpd_features: Optional[torch.Tensor] = None,
                 l2_distance: Optional[torch.Tensor] = None,
                 embedding_diff: Optional[torch.Tensor] = None,
+                npr_features: Optional[torch.Tensor] = None,
                 use_max_for_eval: bool = False,
                 **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -204,7 +249,8 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             "temporal_diff": temporal_diff,
             "lpd_features": lpd_features,
             "l2_distance": l2_distance,
-            "embedding_diff": embedding_diff
+            "embedding_diff": embedding_diff,
+            "npr_features": npr_features
         }
 
         # Route to base implementation
