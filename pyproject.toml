@@ -25,6 +25,11 @@ dependencies = [
     "decord>=0.6.0",
     "av>=10.0.0",
     "accelerate>=0.20.0",
+
+    # Inference API
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "python-multipart>=0.0.9",
 ]
 
 [tool.uv]

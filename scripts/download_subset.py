@@ -244,7 +244,10 @@ def download_genbuster(dest_dir, num_videos, hf_token):
         for fname in files:
             if fname.lower().endswith(".mp4"):
                 src = os.path.join(root, fname)
-                dst = os.path.join(dest_dir, fname)
+                rel_dir = os.path.relpath(root, staging)
+                out_dir = os.path.join(dest_dir, "genbuster", rel_dir)
+                os.makedirs(out_dir, exist_ok=True)
+                dst = os.path.join(out_dir, fname)
                 if not os.path.exists(dst):
                     shutil.move(src, dst)
                 count += 1
@@ -330,9 +333,12 @@ def download_synth_vid_detect(dest_dir, num_videos, hf_token=None):
     prefix = f"datasets/{REPO_ID}/"
     for hf_path in tqdm(all_files, desc="  synth-vid-detect"):
         filename = hf_path[len(prefix):] if hf_path.startswith(prefix) else hf_path
-        model_name = filename.split("/")[-2] if "/" in filename else "fake"
-        flat_name = f"{model_name}_{os.path.basename(filename)}"
-        dest_path = os.path.join(dest_dir, flat_name)
+        model_name = filename.split("/")[-2] if "/" in filename else "synth_unknown"
+        
+        out_dir = os.path.join(dest_dir, "synth", model_name)
+        os.makedirs(out_dir, exist_ok=True)
+        dest_path = os.path.join(out_dir, os.path.basename(filename))
+        
         if os.path.exists(dest_path):
             downloaded += 1
             continue
@@ -385,7 +391,9 @@ def download_opensora_zips(dest_dir, num_videos, hf_token=None):
         except Exception as e:
             print(f"  ✗ {cfg['label']}: {e}")
             continue
-        extracted = _extract_zip_mp4s(zip_path, dest_dir, need, prefix=cfg["label"])
+        
+        prefix = f"opensora/{cfg['label'].split('_')[1]}" if "_" in cfg["label"] else "opensora"
+        extracted = _extract_zip_mp4s(zip_path, dest_dir, need, prefix=prefix)
         print(f"  ✓ {cfg['label']}: {extracted} videos")
         total += extracted
     return total
@@ -406,8 +414,11 @@ def _extract_zip_mp4s(zip_path, dest_dir, max_count, prefix=""):
         with zipfile.ZipFile(zip_path, "r") as zf:
             mp4s = [n for n in zf.namelist() if n.lower().endswith(".mp4")]
             for name in tqdm(mp4s[:max_count], desc=f"  Extracting {prefix}"):
-                flat = f"{prefix}_{os.path.basename(name)}" if prefix else os.path.basename(name)
-                dst = os.path.join(dest_dir, flat)
+                rel_dir = os.path.dirname(name)
+                out_dir = os.path.join(dest_dir, prefix, rel_dir) if prefix else os.path.join(dest_dir, rel_dir)
+                os.makedirs(out_dir, exist_ok=True)
+                
+                dst = os.path.join(out_dir, os.path.basename(name))
                 if not os.path.exists(dst):
                     with zf.open(name) as src, open(dst, "wb") as out:
                         shutil.copyfileobj(src, out)
@@ -417,8 +428,12 @@ def _extract_zip_mp4s(zip_path, dest_dir, max_count, prefix=""):
             with tarfile.open(zip_path) as tf:
                 members = [m for m in tf.getmembers() if m.name.endswith(".mp4")]
                 for m in members[:max_count]:
+                    rel_dir = os.path.dirname(m.name)
+                    out_dir = os.path.join(dest_dir, prefix, rel_dir) if prefix else os.path.join(dest_dir, rel_dir)
+                    os.makedirs(out_dir, exist_ok=True)
+                    
                     m.name = os.path.basename(m.name)
-                    tf.extract(m, path=dest_dir)
+                    tf.extract(m, path=out_dir)
                     extracted += 1
         except Exception as e:
             print(f"  Error: {e}")

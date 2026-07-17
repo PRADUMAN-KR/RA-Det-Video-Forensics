@@ -48,13 +48,13 @@ def main():
     
     # 2. Models
     print("Initializing models...")
-    feature_dim = 768  # For videomae_base, adjust if using large
-    encoder = load_video_encoder("videomae_base", device=device)
+    feature_dim = 1024  # For videomae_large
+    encoder = load_video_encoder("MCG-NJU/videomae-large", device=device)
     for param in encoder.parameters():
         param.requires_grad = False
     encoder.eval()
     
-    decoder = UNetDecoder3D(embed_dim=feature_dim, eps=16/255).to(device)
+    decoder = UNetDecoder3D(embed_dim=feature_dim, eps=16/255, bottleneck_size=14).to(device)
     
     classifier = VideoEnsembleClassifier(
         video_encoder=encoder,
@@ -113,9 +113,10 @@ def main():
         encoder.eval()
         decoder.eval()
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for videos, labels in pbar:
-            videos, labels = videos.to(device), labels.to(device)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=True)
+        for i, batch in enumerate(pbar):
+            videos = batch['video'].to(device)
+            labels = batch['label'].to(device)
             labels = labels.float().unsqueeze(1)  # [B, 1]
             
             # Step 1: Compute NPR Features (no grads needed for extraction)
@@ -155,6 +156,8 @@ def main():
                 logits = outputs[0]
             else:
                 logits = outputs
+            
+            logits = logits.view(-1, 1)
                 
             loss = criterion(logits, labels)
             loss.backward()
@@ -166,7 +169,10 @@ def main():
             correct += (preds == labels).sum().item()
             total += videos.size(0)
             
-            pbar.set_postfix({"Loss": loss.item(), "Acc": correct / total})
+            # Print verbose logging every 50 batches
+            if (i + 1) % 50 == 0:
+                print(f"Epoch [{epoch+1}/{args.epochs}] | Batch [{i+1}/{len(train_loader)}] | "
+                      f"Loss: {loss.item():.4f} | Running Acc: {correct / total:.4f}", flush=True)
             
         epoch_loss = total_loss / total
         epoch_acc = correct / total
