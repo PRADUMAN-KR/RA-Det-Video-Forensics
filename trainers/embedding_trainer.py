@@ -38,6 +38,7 @@ from rfnt_models.scratch_models.multi_scale_difference_cnn import MultiScaleDiff
 # Import new flexible ensemble classifier
 from rfnt_models.ensemble import BackwardCompatibleEnsemble as EnsembleClassifier
 from rfnt_models.ensemble import FourBranchEnsemble, ThreeBranchEnsembleNoLPD
+from rfnt_models.ensemble.npr import extract_npr_features
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1558,7 +1559,9 @@ class EmbeddingTrainer:
                         dropout=0.1,
                         temperature=1.0,
                         fusion_method=self.fusion_method,
-                        use_four_branch=self.use_four_branch_ensemble
+                        use_four_branch=self.use_four_branch_ensemble,
+                        use_npr_branch=getattr(self, "use_npr_branch", True),
+                        use_direct_feature_branch=True,
                     ).to(self.device)
                 else:
                     # Use EnsembleClassifier with foundation + scratch branches
@@ -1877,7 +1880,9 @@ class EmbeddingTrainer:
                         "temporal_diff": temporal_diff,
                         "lpd_features": lpd_features,
                         "l2_distance": torch.norm(clean_embeddings - noisy_embeddings, p=2, dim=1, keepdim=True),
-                        "embedding_diff": clean_embeddings - noisy_embeddings
+                        "embedding_diff": clean_embeddings - noisy_embeddings,
+                        "clean_embedding": clean_embeddings,   # DirectFeatureBranch anchor
+                        "npr_features": extract_npr_features(video) if hasattr(self, '_use_npr') else None,
                     }
 
                     outputs = self.classifier(use_max_for_eval=False, **inputs)
@@ -2533,3 +2538,9 @@ def cleanup_ddp():
     """Cleanup distributed training environment"""
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+
+
+
+# website-bucket-54b674a0-81c5

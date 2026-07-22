@@ -1,7 +1,7 @@
 """
 RA-Det FastAPI Inference Pipeline — Temporal Video Deepfake Detection.
 
-Loads the trained epoch-4 ensemble checkpoint
+Loads the trained epoch-5 NPR ensemble checkpoint
 (VideoMAE encoder + UNetDecoder3D + VideoEnsembleClassifier)
 and exposes a REST API for real/fake video classification.
 
@@ -39,6 +39,11 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from rfnt_models.ensemble.video_classifier import VideoEnsembleClassifier
+from rfnt_models.ensemble.npr import extract_npr_features
+from detectors.provenance import check_provenance
+from detectors.anomaly_detector import VideoAnomalyDetector
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -52,11 +57,14 @@ logger = logging.getLogger("ra_det_api")
 # ===========================================================================
 # Configuration — mirrors the training config exactly
 # ===========================================================================
-CHECKPOINT_PATH = os.path.join(
-    PROJECT_ROOT,
-    "checkpoints",
-    "ensemble_vitl16_raw_lpd_discrepancy",
-    "checkpoint_epoch_4.pt",
+CHECKPOINT_PATH = os.getenv(
+    "CHECKPOINT_PATH",
+    os.path.join(
+        PROJECT_ROOT,
+        "checkpoints",
+        "npr_ensemble",
+        "npr_ensemble_epoch_5.pt",
+    ),
 )
 
 MODEL_NAME     = "MCG-NJU/videomae-large"
@@ -101,13 +109,14 @@ VIDEOMAE_STD  = [0.5, 0.5, 0.5]
 # Global model container (populated at startup)
 # ===========================================================================
 class ModelStore:
-    encoder:         Optional[torch.nn.Module] = None
-    decoder:         Optional[torch.nn.Module] = None
-    classifier:      Optional[torch.nn.Module] = None
-    device:          Optional[torch.device]    = None
-    feature_dim:     int                       = 1024
-    checkpoint_epoch: int                      = 0
-    load_time_s:     float                     = 0.0
+    encoder:          Optional[torch.nn.Module]   = None
+    decoder:          Optional[torch.nn.Module]   = None
+    classifier:       Optional[torch.nn.Module]   = None
+    anomaly_detector: Optional[VideoAnomalyDetector] = None
+    device:           Optional[torch.device]      = None
+    feature_dim:      int                         = 1024
+    checkpoint_epoch: int                         = 0
+    load_time_s:      float                       = 0.0
 
 
 _store = ModelStore()
@@ -186,17 +195,22 @@ def _load_models(device: torch.device) -> None:
     decoder.eval()
     classifier.eval()
 
-    # 5. Populate global store
+    # 5. Layer 2 Anomaly Detector
+    anomaly_ckpt = os.getenv("ANOMALY_CHECKPOINT_PATH", os.path.join(PROJECT_ROOT, "checkpoints", "anomaly_detector", "anomaly_detector_best.pt"))
+    anomaly_detector = VideoAnomalyDetector(encoder=encoder, feature_dim=feature_dim, checkpoint_path=anomaly_ckpt).to(device)
+
+    # 6. Populate global store
     _store.encoder          = encoder
     _store.decoder          = decoder
     _store.classifier       = classifier
+    _store.anomaly_detector = anomaly_detector
     _store.device           = device
     _store.feature_dim      = feature_dim
-    _store.checkpoint_epoch = int(ckpt.get("epoch", 0))
+    _store.checkpoint_epoch = int(ckpt.get("epoch_npr", ckpt.get("epoch", 0)))
     _store.load_time_s      = time.time() - t0
 
     logger.info(
-        "All models ready. Load time: %.1fs | Device: %s",
+        "All 3 Cascade Layers ready (Layer 1: C2PA, Layer 2: Anomaly, Layer 3: RA-Det). Load time: %.1fs | Device: %s",
         _store.load_time_s, device,
     )
 
@@ -318,7 +332,8 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
             l2_distance      = l2_dist,
             embedding_diff   = emb_diff,
             npr_features     = npr_features,
-            use_max_for_eval = False,     # logit_weighted fusion (trained weights)
+            clean_embedding  = clean_emb,  # DirectFeatureBranch anchor
+            use_max_for_eval = False,
         )
 
     if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
@@ -478,6 +493,11 @@ async def info():
             "fake_l2":           6.1752,
             "l2_gap":            5.3681,
         },
+        "cascade_layers": {
+            "layer_1": "C2PA Digital Provenance Check (~1ms)",
+            "layer_2": "VideoMAE Anomaly Reconstruction Detector (~200ms)",
+            "layer_3": "RA-Det 6-Branch Spatiotemporal Ensemble (~1.5s)"
+        }
     }
 
 
@@ -488,26 +508,17 @@ VALID_MODES        = {"classifier", "embedding", "hybrid"}
 @app.post("/predict", tags=["inference"])
 async def predict(
     file: UploadFile = File(...),
-    mode: str = Query("classifier", description="Decision strategy: classifier, embedding, or hybrid"),
-    threshold: Optional[float] = Query(None, description="Custom threshold (0.0 to 1.0). If None, defaults to FAKE_THRESHOLD.")
+    mode: str = Query("classifier", description="Decision strategy for Layer 3: classifier, embedding, or hybrid"),
+    threshold: Optional[float] = Query(None, description="Custom threshold (0.0 to 1.0). If None, defaults to FAKE_THRESHOLD."),
+    disable_cascade: bool = Query(False, description="Set True to force full Layer 3 RA-Det execution bypassing Layer 1 and Layer 2 short-circuiting.")
 ):
     """
-    Upload a video file and receive a real/fake prediction.
+    Upload a video file and receive a real/fake prediction through the 3-Layer Cascade.
 
-    **mode** (query parameter) — controls the decision strategy:
-    - `classifier` *(default)* — trained VideoEnsembleClassifier with
-      logit_weighted fusion. Best on training distribution.
-    - `embedding` — embedding-discrepancy score calibrated from
-      validation stats (real l2=0.81, fake l2=6.18). More
-      distribution-robust; weaker on subtle fakes.
-    - `hybrid` — average of classifier + embedding scores.
-
-    Example:
-        POST /predict?mode=embedding
-        POST /predict?mode=hybrid
-
-    Returns JSON with prediction, probability, confidence, signal_source,
-    and a details block containing all raw signals for transparency.
+    **3-Layer Cascade Pipeline**:
+    - **Layer 1 (C2PA Provenance)**: Instant (~1ms) digital manifest check for C2PA AI/Camera signatures.
+    - **Layer 2 (VideoMAE Anomaly)**: Fast (~200ms) reconstruction MSE check against real camera physics.
+    - **Layer 3 (RA-Det Ensemble)**: Deep (~1.5s) 6-branch spatiotemporal ensemble analysis.
     """
     if _store.encoder is None:
         raise HTTPException(status_code=503, detail="Models not loaded.")
@@ -535,26 +546,94 @@ async def predict(
 
         logger.info("Received: %s (%.1f KB) mode=%s", file.filename, len(content) / 1024, mode)
 
+        # -------------------------------------------------------------------
+        # LAYER 1: C2PA Digital Provenance Check (~1ms)
+        # -------------------------------------------------------------------
+        t_l1 = time.time()
+        prov = check_provenance(tmp_path)
+        l1_time = time.time() - t_l1
+
+        if not disable_cascade and prov["verdict"] != "unknown":
+            is_fake = (prov["verdict"] == "ai_generated")
+            total_s = time.time() - t_start
+            logger.info("Layer 1 hit: %s (generator=%s, %.3fs)", prov["verdict"], prov.get("generator"), l1_time)
+            return JSONResponse(content={
+                "prediction": "fake" if is_fake else "real",
+                "probability": 1.0 if is_fake else 0.0,
+                "confidence": "very_high",
+                "decided_by": "layer_1_provenance_c2pa",
+                "filename": file.filename,
+                "timing": {"l1_s": round(l1_time, 4), "total_s": round(total_s, 4)},
+                "cascade": {
+                    "layer_1_provenance": prov,
+                    "layer_2_anomaly": None,
+                    "layer_3_radet": None
+                }
+            })
+
+        # -------------------------------------------------------------------
+        # Preprocess Video
+        # -------------------------------------------------------------------
         t_prep = time.time()
         try:
             video_tensor = preprocess_video(tmp_path)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
-        logger.info("Preprocessing: %.2fs", time.time() - t_prep)
+        prep_time = time.time() - t_prep
+        logger.info("Preprocessing: %.2fs", prep_time)
 
-        t_inf   = time.time()
-        raw     = run_inference(video_tensor)
-        
+        # -------------------------------------------------------------------
+        # LAYER 2: VideoMAE Anomaly Reconstruction Error Check (~200ms)
+        # -------------------------------------------------------------------
+        t_l2 = time.time()
+        anomaly = _store.anomaly_detector.score(video_tensor) if _store.anomaly_detector else {"verdict": "uncertain"}
+        l2_time = time.time() - t_l2
+
+        if not disable_cascade and anomaly["verdict"] != "uncertain":
+            is_fake = (anomaly["verdict"] == "fake")
+            total_s = time.time() - t_start
+            logger.info("Layer 2 hit: %s (mse=%.5f, %.3fs)", anomaly["verdict"], anomaly["mse_error"], l2_time)
+            return JSONResponse(content={
+                "prediction": anomaly["verdict"],
+                "probability": anomaly["anomaly_score"],
+                "confidence": anomaly["confidence"],
+                "decided_by": "layer_2_video_anomaly",
+                "filename": file.filename,
+                "timing": {"l1_s": round(l1_time, 4), "l2_s": round(l2_time, 4), "total_s": round(total_s, 4)},
+                "cascade": {
+                    "layer_1_provenance": prov,
+                    "layer_2_anomaly": anomaly,
+                    "layer_3_radet": None
+                }
+            })
+
+        # -------------------------------------------------------------------
+        # LAYER 3: RA-Det 6-Branch Spatiotemporal Ensemble (~1.5s)
+        # -------------------------------------------------------------------
+        t_l3 = time.time()
+        raw = run_inference(video_tensor)
         active_threshold = threshold if threshold is not None else FAKE_THRESHOLD
-        result  = _make_decision(raw, mode, threshold=active_threshold)
-        inf_time = time.time() - t_inf
+        result = _make_decision(raw, mode, threshold=active_threshold)
+        l3_time = time.time() - t_l3
 
-        result["timing"]   = {"inference_s": round(inf_time, 3), "total_s": round(time.time() - t_start, 3)}
-        result["filename"] = file.filename
+        total_s = time.time() - t_start
+        result["decided_by"] = "layer_3_radet_ensemble"
+        result["filename"]   = file.filename
+        result["timing"]     = {
+            "l1_s": round(l1_time, 4),
+            "l2_s": round(l2_time, 4),
+            "l3_s": round(l3_time, 4),
+            "total_s": round(total_s, 4)
+        }
+        result["cascade"] = {
+            "layer_1_provenance": prov,
+            "layer_2_anomaly": anomaly,
+            "layer_3_radet": raw
+        }
 
         logger.info(
-            "Result [%s]: %s (prob=%.4f, %.2fs)",
-            mode, result["prediction"], result["probability"], inf_time,
+            "Layer 3 result [%s]: %s (prob=%.4f, l3=%.2fs, total=%.2fs)",
+            mode, result["prediction"], result["probability"], l3_time, total_s,
         )
         return JSONResponse(content=result)
 

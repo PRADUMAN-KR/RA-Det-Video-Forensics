@@ -64,12 +64,21 @@ class VideoDataset(Dataset):
         # VideoMAE was pretrained with mean=[0.5, 0.5, 0.5] std=[0.5, 0.5, 0.5],
         # NOT ImageNet statistics. Using ImageNet stats shifts the input distribution
         # and degrades embedding quality.
+        # Default transforms matching VideoMAE expected resolution and normalization.
         if transform is None:
-            self.transform = T.Compose([
-                T.Resize((224, 224)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # VideoMAE pretraining stats
-            ])
+            if split == "train":
+                self.transform = T.Compose([
+                    T.Resize((224, 224)),
+                    T.RandomHorizontalFlip(p=0.5),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # VideoMAE pretraining stats
+                ])
+            else:
+                self.transform = T.Compose([
+                    T.Resize((224, 224)),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # VideoMAE pretraining stats
+                ])
         else:
             self.transform = transform
 
@@ -91,77 +100,63 @@ class VideoDataset(Dataset):
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
             # Check if this directory represents a real or fake folder
             label = None
-            if "0_real" in Path(dirpath).parts or "0_real" in dirnames:
-                label = 0
-            elif "1_fake" in Path(dirpath).parts or "1_fake" in dirnames:
-                label = 1
+            path_parts_lower = [p.lower() for p in Path(dirpath).parts]
+            
+            for part in path_parts_lower:
+                if any(k in part for k in ["0_real", "real", "kinetics"]):
+                    label = 0
+                    break
+                elif any(k in part for k in ["1_fake", "fake", "genbuster", "synthetic", "aigc"]):
+                    label = 1
+                    break
 
             # Extract generator type from path parts if available
             generator = "unknown"
-            # Comprehensive list of known generators and dataset names:
-            # - Classic deepfake datasets: FaceForensics++, DFDC, CelebDF, WildDeepfake, DeeperForensics
-            # - FF++ manipulation methods: DeepFakes, Face2Face, FaceSwap, NeuralTextures, FaceShifter
-            # - GAN-based video generators: ProGAN, StyleGAN, BigGAN
-            # - Diffusion/flow-based video generators: Stable Diffusion Video, ModelScope, ZeroScope
-            # - Next-gen commercial platforms: Sora, Runway Gen-2/Gen-3, Pika, Kling, Luma Dream Machine,
-            #                                  Veo (Google), Wan (Alibaba), Hailuo, Morphic, Lightricks LTX
             KNOWN_GENERATORS = {
-                # --- Classic Deepfake Datasets ---
                 'faceforensics', 'faceforensics++', 'ff++',
                 'dfdc', 'deepfakedetectionchallenge',
                 'celebdf', 'celeb_df', 'celeb-df',
                 'wilddeepfake', 'wild_deepfake',
                 'deeperforensics', 'deeper_forensics',
                 'fakedav', 'fake_av',
-
-                # --- FF++ Manipulation Methods ---
                 'deepfakes', 'deepfake',
                 'face2face', 'faceswap', 'face_swap',
                 'neuraltextures', 'neural_textures',
                 'faceshifter', 'face_shifter',
-
-                # --- GAN-based Generators ---
                 'progan', 'stylegan', 'stylegan2', 'biggan',
                 'stargan', 'cyclegan',
-
-                # --- Diffusion / Flow-based Video Generators ---
                 'stable_diffusion', 'stable_diffusion_video', 'sdv',
                 'modelscope', 'zeroscope', 'animatediff',
                 'opensora', 'open_sora', 'cogvideo', 'cogvideox',
                 'lavie', 'show_one', 'videocrafter',
-
-                # --- Next-Gen Commercial Platforms ---
-                'sora',                          # OpenAI Sora
-                'runway', 'gen2', 'gen3',        # Runway Gen-2 / Gen-3
-                'pika', 'pika_labs',             # Pika Labs
-                'luma', 'lumaai',                # Luma Dream Machine
-                'kling', 'klingai',              # Kuaishou Kling
-                'veo', 'veo2',                   # Google Veo
-                'wan', 'wan2',                   # Alibaba Wan
-                'hailuo', 'minimax',             # MiniMax Hailuo
-                'ltx', 'lightricks',             # Lightricks LTX-Video
-                'morphic', 'pixverse',           # Other platforms
-                'genmo', 'mochi',                # Genmo Mochi
-                'hunyuan', 'hunyuanvideo',       # Tencent HunyuanVideo
-                'step', 'stepvideo',             # Step Video
+                'sora', 'runway', 'gen2', 'gen3',
+                'pika', 'pika_labs', 'luma', 'lumaai',
+                'kling', 'klingai', 'veo', 'veo2',
+                'wan', 'wan2', 'hailuo', 'minimax',
+                'ltx', 'lightricks', 'morphic', 'pixverse',
+                'genmo', 'mochi', 'hunyuan', 'hunyuanvideo',
+                'step', 'stepvideo',
             }
             for part in Path(dirpath).parts:
                 if part.lower() in KNOWN_GENERATORS:
                     generator = part.lower()
                     break
+            
+            if generator == "unknown" and label == 1:
+                parent_name = os.path.basename(dirpath)
+                if parent_name.lower() not in ["1_fake", "fake", "genbuster", "synthetic", "aigc"]:
+                    generator = parent_name
 
             # 1. Collect Video Files
             for name in filenames:
                 if name.lower().endswith(self.VIDEO_EXTS):
                     video_path = os.path.join(dirpath, name)
-                    # Correct label detection based on filename parent directory
                     item_label = label
                     if item_label is None:
-                        # Try to detect from file parent dir name
-                        parent_name = os.path.basename(dirpath)
-                        if "real" in parent_name.lower() or "0" in parent_name:
+                        parent_name = os.path.basename(dirpath).lower()
+                        if any(k in parent_name for k in ["real", "0", "kinetics"]):
                             item_label = 0
-                        elif "fake" in parent_name.lower() or "1" in parent_name:
+                        elif any(k in parent_name for k in ["fake", "1", "genbuster", "synthetic"]):
                             item_label = 1
                         else:
                             continue  # Skip if can't resolve label

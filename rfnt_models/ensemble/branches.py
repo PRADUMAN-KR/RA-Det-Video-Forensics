@@ -186,16 +186,19 @@ class L2DistanceBranch(BaseBranch):
         self.dropout = dropout
 
         # Build MLP: 1 -> 128 -> 64 -> 1
+        # LayerNorm instead of BatchNorm1d: works at any batch size including B=1.
+        # Video training is VRAM-limited and often runs at B=2; BatchNorm1d produces
+        # noisy/wrong statistics at small batch sizes and crashes at B=1.
         layers = []
         prev_dim = 1  # Input is scalar L2 distance
 
         for i, hidden_dim in enumerate(hidden_dims):
             layers.append(nn.Linear(prev_dim, hidden_dim))
 
-            # No BatchNorm or Dropout on final layer
+            # No LayerNorm or Dropout on final layer
             if i < len(hidden_dims) - 1:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-                layers.append(nn.ReLU(inplace=True))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.GELU())
                 if dropout > 0:
                     layers.append(nn.Dropout(dropout))
 
@@ -268,6 +271,7 @@ class EmbeddingDiffBranch(BaseBranch):
         self.dropout = dropout
 
         # Build MLP: feature_dim -> 512 -> 256 -> 1
+        # LayerNorm instead of BatchNorm1d: works at any batch size including B=1.
         layers = []
         prev_dim = feature_dim
 
@@ -275,8 +279,8 @@ class EmbeddingDiffBranch(BaseBranch):
             layers.append(nn.Linear(prev_dim, hidden_dim))
 
             if i < len(hidden_dims) - 1:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-                layers.append(nn.ReLU(inplace=True))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.GELU())
                 if dropout > 0:
                     layers.append(nn.Dropout(dropout))
 

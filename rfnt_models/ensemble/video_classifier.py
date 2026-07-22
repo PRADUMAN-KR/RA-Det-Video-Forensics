@@ -144,15 +144,72 @@ class VideoNPRBranch(BaseBranch):
         return ["npr_features"]
 
 
+class DirectFeatureBranch(BaseBranch):
+    """
+    Anchor branch: classifies directly from the frozen VideoMAE CLS embedding.
+
+    This branch does NOT use the adversarial decoder output at all — it takes the
+    clean VideoMAE embedding and runs it through a small MLP. Because it is completely
+    independent of the 3D UNet decoder, it prevents ensemble collapse when the decoder
+    learns a bad or overfit perturbation strategy on the training distribution.
+
+    This is the most important branch for out-of-distribution generalisation:
+    VideoMAE was pretrained on real camera footage (Kinetics-400) and already
+    encodes temporal physics and motion patterns. A linear probe on top of its
+    CLS token can find the real/fake boundary without needing adversarial noise.
+
+    Input:  clean_embedding [B, D] — frozen VideoMAE CLS token (no gradient required)
+    Output: logits [B, 1]
+    """
+
+    def __init__(
+        self,
+        name: str = "direct_feature",
+        feature_dim: int = 1024,
+        hidden_dims: List[int] = None,
+        dropout: float = 0.1
+    ):
+        super().__init__(name)
+        if hidden_dims is None:
+            hidden_dims = [512, 256]
+
+        layers = []
+        prev_dim = feature_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, 1))
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, **kwargs) -> torch.Tensor:
+        clean_embedding = kwargs.get("clean_embedding")
+        if clean_embedding is None:
+            raise ValueError("DirectFeatureBranch requires 'clean_embedding' input tensor")
+        # Detach from the encoder graph — we only want to train the MLP head,
+        # not accidentally allow gradients to flow back into VideoMAE.
+        return self.mlp(clean_embedding.detach())
+
+    def get_input_keys(self) -> List[str]:
+        return ["clean_embedding"]
+
+
 class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
     """
     Video Ensemble Classifier combining foundation, scratch, and difference branches in 3D.
 
     Branches:
-      1. Foundation: frozen VideoMAE + trainable MLP classifier head.
-      2. Scratch:    R3D-18 3D CNN trained from scratch on noise + temporal diffs.
-      3. L2Distance:  MLP on L2 norm of (clean_emb - noisy_emb).
-      4. EmbeddingDiff: MLP on element-wise (clean_emb - noisy_emb) vector.
+      1. Foundation:      frozen VideoMAE + trainable MLP classifier head.
+      2. Scratch:         R3D-18 3D CNN trained from scratch on noise + temporal diffs.
+      3. L2Distance:      MLP on L2 norm of (clean_emb - noisy_emb).
+      4. EmbeddingDiff:   MLP on element-wise (clean_emb - noisy_emb) vector.
+      5. NPR:             MLP on NPR pixel-relation features.
+      6. DirectFeature:   MLP on raw clean VideoMAE embedding (decoder-independent anchor).
     """
 
     def __init__(self,
@@ -165,7 +222,8 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                  temperature: float = 1.0,
                  fusion_method: str = "logit_weighted",
                  use_four_branch: bool = True,
-                 use_npr_branch: bool = False):
+                 use_npr_branch: bool = False,
+                 use_direct_feature_branch: bool = True):
         super().__init__(fusion_method=fusion_method, temperature=temperature)
         
         self.video_encoder = video_encoder
@@ -222,6 +280,20 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             )
             self.register_branch(npr_branch)
 
+        if use_direct_feature_branch:
+            # 6. DirectFeature Branch — decoder-independent anchor branch.
+            # Classifies from the raw frozen VideoMAE CLS embedding.
+            # Completely independent of the adversarial 3D UNet decoder:
+            # if the decoder overfits to training-distribution artifacts,
+            # this branch still provides a correct gradient signal.
+            direct_branch = DirectFeatureBranch(
+                name="direct_feature",
+                feature_dim=feature_dim,
+                hidden_dims=[512, 256],
+                dropout=dropout
+            )
+            self.register_branch(direct_branch)
+
     def forward(self,
                 video: torch.Tensor,
                 noise: torch.Tensor,
@@ -230,18 +302,21 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                 l2_distance: Optional[torch.Tensor] = None,
                 embedding_diff: Optional[torch.Tensor] = None,
                 npr_features: Optional[torch.Tensor] = None,
+                clean_embedding: Optional[torch.Tensor] = None,
                 use_max_for_eval: bool = False,
                 **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Overridden forward to run the generic FlexibleEnsembleClassifier routing.
 
         Args:
-            video:          [B, T, C, H, W]  - original video frames (T-first for VideoMAE).
-            noise:          [B, C, T, H, W]  - 3D UNet adversarial noise.
-            temporal_diff:  [B, C, T, H, W]  - frame-to-frame difference (motion signal).
-            lpd_features:   [B, C, T, H, W]  - optional, 2D-LPD features (None in video mode).
-            l2_distance:    [B, 1]           - L2 norm of embedding delta.
-            embedding_diff: [B, D]           - element-wise embedding delta.
+            video:           [B, T, C, H, W]  - original video frames (T-first for VideoMAE).
+            noise:           [B, C, T, H, W]  - 3D UNet adversarial noise.
+            temporal_diff:   [B, C, T, H, W]  - frame-to-frame difference (motion signal).
+            lpd_features:    [B, C, T, H, W]  - optional, 2D-LPD features (None in video mode).
+            l2_distance:     [B, 1]           - L2 norm of embedding delta.
+            embedding_diff:  [B, D]           - element-wise embedding delta.
+            npr_features:    [B, 48]          - NPR pixel-relation features.
+            clean_embedding: [B, D]           - raw frozen VideoMAE CLS embedding (anchor branch).
         """
         inputs = {
             "video": video,
@@ -250,7 +325,8 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             "lpd_features": lpd_features,
             "l2_distance": l2_distance,
             "embedding_diff": embedding_diff,
-            "npr_features": npr_features
+            "npr_features": npr_features,
+            "clean_embedding": clean_embedding,
         }
 
         # Route to base implementation
