@@ -187,42 +187,55 @@ def download_kinetics400_real(dest_dir, num_videos, hf_token):
 
 def _download_hf_with_progress(repo_id, filename, repo_type, token, dest_path, part_label):
     """
-    Download a single HuggingFace file with a real-time tqdm progress bar
-    showing speed, size transferred, and ETA.
-    Falls back to silent hf_hub_download on older huggingface_hub versions.
+    Download a single HuggingFace file atomically to a .tmp file first.
+    Verifies full Content-Length before renaming to dest_path.
     """
+    tmp_path = dest_path + ".tmp"
     try:
         import requests
         from tqdm import tqdm
         from huggingface_hub import hf_hub_url
 
         url = hf_hub_url(repo_id=repo_id, filename=filename, repo_type=repo_type)
-
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+
         t0 = time.time()
         with requests.get(url, headers=headers, stream=True, timeout=120) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0)) or None
             total_mb = f"{total/1024**2:.0f} MB" if total else "? MB"
             print(f"  ↓ {part_label}  ({total_mb})", flush=True)
+
             with tqdm(
                 total=total, unit="B", unit_scale=True, unit_divisor=1024,
                 desc=f"    {part_label[:28]:28s}",
                 dynamic_ncols=True, leave=True,
             ) as bar:
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=2 << 20):  # 2 MB chunks
                         if chunk:
                             f.write(chunk)
                             bar.update(len(chunk))
+
+        # Verify downloaded size if total content-length was given
+        downloaded_size = os.path.getsize(tmp_path)
+        if total and downloaded_size < total:
+            raise IOError(f"Incomplete download: got {downloaded_size} bytes, expected {total} bytes")
+
+        os.replace(tmp_path, dest_path)
         elapsed = time.time() - t0
         size_mb = os.path.getsize(dest_path) / 1024**2
-        print(f"    ✓ {part_label} done — {size_mb:.0f} MB in {elapsed:.0f}s ({size_mb/elapsed:.1f} MB/s)",
+        print(f"    ✓ {part_label} done — {size_mb:.0f} MB in {elapsed:.0f}s ({size_mb/max(1, elapsed):.1f} MB/s)",
               flush=True)
         return True
+
     except Exception as e:
-        # Fallback: silent hf_hub_download (works even without requests)
-        print(f"  ↓ {part_label} (progress unavailable: {e}) — downloading silently...", flush=True)
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        print(f"  ↓ {part_label} (progress failed: {e}) — downloading via hf_hub_download...", flush=True)
         from huggingface_hub import hf_hub_download
         t0 = time.time()
         cached = hf_hub_download(
@@ -234,6 +247,21 @@ def _download_hf_with_progress(repo_id, filename, repo_type, token, dest_path, p
         size_mb = os.path.getsize(dest_path) / 1024**2
         print(f"    ✓ {part_label} done — {size_mb:.0f} MB in {elapsed:.0f}s", flush=True)
         return True
+
+
+def get_remote_file_size(repo_id, filename, repo_type, token):
+    """Fetch expected Content-Length for a remote HF file."""
+    try:
+        import requests
+        from huggingface_hub import hf_hub_url
+        url = hf_hub_url(repo_id=repo_id, filename=filename, repo_type=repo_type)
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        with requests.head(url, headers=headers, allow_redirects=True, timeout=30) as r:
+            if r.status_code == 200:
+                return int(r.headers.get("content-length", 0))
+    except Exception:
+        pass
+    return None
 
 
 def download_genbuster(dest_dir, num_videos, hf_token):
@@ -264,17 +292,32 @@ def download_genbuster(dest_dir, num_videos, hf_token):
 
     overall_t0 = time.time()
     print(f"\n  Downloading {NUM_PARTS} archive parts (~108 GB total)...")
-    print(f"  Each part ≈ 4 GB — expect 3–15 min/part depending on network speed.\n")
+    print(f"  Each part ≈ 4 GB — checking integrity of cached parts...\n")
 
     for i in range(1, NUM_PARTS + 1):
         part_name = f"GenBuster-200K.7z.{i:03d}"
         part_path = os.path.join(staging, part_name)
 
-        if os.path.exists(part_path) and os.path.getsize(part_path) > 100_000:
-            size_mb = os.path.getsize(part_path) / 1024**2
-            print(f"  ✓ [{i:02d}/{NUM_PARTS}] {part_name} already cached ({size_mb:.0f} MB)",
-                  flush=True)
-            continue
+        # Check if local file exists and is valid
+        if os.path.exists(part_path):
+            local_size = os.path.getsize(part_path)
+            remote_size = get_remote_file_size(REPO_ID, part_name, "dataset", hf_token)
+
+            if remote_size and local_size == remote_size:
+                size_mb = local_size / 1024**2
+                print(f"  ✓ [{i:02d}/{NUM_PARTS}] {part_name} verified ({size_mb:.0f} MB)", flush=True)
+                continue
+            elif not remote_size and local_size > 3_500_000_000:
+                size_mb = local_size / 1024**2
+                print(f"  ✓ [{i:02d}/{NUM_PARTS}] {part_name} cached ({size_mb:.0f} MB)", flush=True)
+                continue
+            else:
+                expected_mb = f"{remote_size / 1024**2:.0f} MB" if remote_size else "expected size"
+                print(f"  ⚠️ [{i:02d}/{NUM_PARTS}] {part_name} incomplete/corrupt ({local_size / 1024**2:.0f} MB vs {expected_mb}). Re-downloading...", flush=True)
+                try:
+                    os.remove(part_path)
+                except Exception:
+                    pass
 
         elapsed_total = time.time() - overall_t0
         parts_done = i - 1

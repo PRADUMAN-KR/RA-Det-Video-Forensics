@@ -129,19 +129,29 @@ def _load_models(device: torch.device) -> None:
     """
     Instantiate and load all three model components from the checkpoint.
 
-    Architecture exactly matches embedding_trainer.py video-mode initialisation:
-      encoder    → VideoMAEWrapper              (frozen)
-      decoder    → UNetDecoder3D               (strategy_channels=0)
-      classifier → VideoEnsembleClassifier     (2-branch: foundation + scratch)
+    Architecture matches embedding_trainer.py video-mode initialisation:
+      encoder    → DINOv2VideoEncoder or VideoMAEWrapper (frozen)
+      decoder    → UNetDecoder3D                        (strategy_channels=0)
+      classifier → VideoEnsembleClassifier              (multi-branch ensemble)
     """
     t0 = time.time()
-    logger.info("Loading VideoMAE encoder: %s", MODEL_NAME)
+    if "dinov2" in MODEL_NAME.lower():
+        logger.info("Loading DINOv2 video encoder: %s", MODEL_NAME)
+        from models.dinov2_video_encoder import DINOv2VideoEncoder
+        encoder = DINOv2VideoEncoder(
+            model_name=MODEL_NAME,
+            num_frames=NUM_FRAMES,
+            temporal_layers=DECODER_KWARGS.get("temporal_transformer_layers", 2),
+            unfreeze_last_n=0,
+            device=str(device),
+        )
+    else:
+        logger.info("Loading VideoMAE encoder: %s", MODEL_NAME)
+        from models.video_encoder_wrapper import VideoMAEWrapper
+        encoder = VideoMAEWrapper(model_name=MODEL_NAME, device=str(device))
 
-    # 1. Encoder — frozen VideoMAE Large
-    from models.video_encoder_wrapper import VideoMAEWrapper
-    encoder = VideoMAEWrapper(model_name=MODEL_NAME, device=str(device))
     encoder.eval()
-    feature_dim = encoder.output_dim  # 1024 for Large
+    feature_dim = encoder.output_dim
     logger.info("Encoder loaded. Feature dim: %d", feature_dim)
 
     # 2. Decoder — UNetDecoder3D
@@ -154,65 +164,71 @@ def _load_models(device: torch.device) -> None:
     logger.info("UNetDecoder3D instantiated.")
 
     # 3. Classifier — VideoEnsembleClassifier
-    #    Matches setup_training_mode("ensemble") in video mode:
-    #      lpd_channels=0, temporal_diff_channels=3, resnet_variant="r3d_18"
-    #      use_four_branch=False  (use_four_branch_ensemble default is False)
     classifier = VideoEnsembleClassifier(
-        video_encoder          = encoder,
-        feature_dim            = feature_dim,
-        lpd_channels           = 0,
-        temporal_diff_channels = 3,
-        resnet_variant         = "r3d_18",
-        dropout                = 0.1,
-        temperature            = 1.0,
-        fusion_method          = "logit_weighted",
-        use_four_branch        = True,   # checkpoint has l2_distance + embedding_diff branches
-        use_npr_branch         = True,   # NPR branch
+        video_encoder                  = encoder,
+        feature_dim                    = feature_dim,
+        lpd_channels                   = 0,
+        temporal_diff_channels         = 3,
+        resnet_variant                 = "r3d_18",
+        dropout                        = 0.1,
+        temperature                    = 1.0,
+        fusion_method                  = "logit_weighted",
+        use_four_branch                = True,   # checkpoint has l2_distance + embedding_diff branches
+        use_npr_branch                 = True,   # NPR branch
+        use_direct_feature_branch     = True,
+        use_temporal_coherence_branch = "dinov2" in MODEL_NAME.lower() or DECODER_KWARGS.get("use_temporal_coherence_branch", False),
+        num_frames                     = NUM_FRAMES,
     ).to(device)
     logger.info("VideoEnsembleClassifier instantiated.")
 
-    # 4. Load checkpoint weights
-    if not os.path.isfile(CHECKPOINT_PATH):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {CHECKPOINT_PATH}\n"
-            "Make sure the container checkpoint is accessible at this path."
+    # Load weights from checkpoint
+    if os.path.exists(CHECKPOINT_PATH):
+        logger.info("Loading checkpoint weights from: %s", CHECKPOINT_PATH)
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
+
+        if "decoder_state_dict" in ckpt:
+            decoder.load_state_dict(ckpt["decoder_state_dict"])
+            logger.info("  ✓ Loaded decoder_state_dict")
+        if "classifier_state_dict" in ckpt:
+            classifier.load_state_dict(ckpt["classifier_state_dict"], strict=False)
+            logger.info("  ✓ Loaded classifier_state_dict")
+        if "epoch" in ckpt:
+            _store.checkpoint_epoch = ckpt["epoch"]
+            logger.info("  ✓ Checkpoint epoch: %d", _store.checkpoint_epoch)
+    else:
+        logger.warning(
+            "Checkpoint NOT found at %s. Running with uninitialised weights!",
+            CHECKPOINT_PATH,
         )
 
-    logger.info("Loading checkpoint: %s", CHECKPOINT_PATH)
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
-
-    decoder.load_state_dict(ckpt["decoder_state_dict"])
-    logger.info("Decoder weights loaded (epoch %d).", ckpt.get("epoch", "?"))
-
-    if "classifier_state_dict" not in ckpt:
-        raise KeyError(
-            "Checkpoint does not contain 'classifier_state_dict'. "
-        "Is this the correct checkpoint file?"
-        )
-    classifier.load_state_dict(ckpt["classifier_state_dict"], strict=False)
-    logger.info("Classifier weights loaded.")
-
+    # Freeze all models for inference
+    encoder.eval()
     decoder.eval()
     classifier.eval()
+    for p in encoder.parameters():    p.requires_grad = False
+    for p in decoder.parameters():    p.requires_grad = False
+    for p in classifier.parameters(): p.requires_grad = False
 
-    # 5. Layer 2 Anomaly Detector
-    anomaly_ckpt = os.getenv("ANOMALY_CHECKPOINT_PATH", os.path.join(PROJECT_ROOT, "checkpoints", "anomaly_detector", "anomaly_detector_best.pt"))
-    anomaly_detector = VideoAnomalyDetector(encoder=encoder, feature_dim=feature_dim, checkpoint_path=anomaly_ckpt).to(device)
+    # Store loaded models
+    _store.encoder     = encoder
+    _store.decoder     = decoder
+    _store.classifier  = classifier
+    _store.device      = device
+    _store.feature_dim = feature_dim
+    _store.load_time_s = time.time() - t0
 
-    # 6. Populate global store
-    _store.encoder          = encoder
-    _store.decoder          = decoder
-    _store.classifier       = classifier
-    _store.anomaly_detector = anomaly_detector
-    _store.device           = device
-    _store.feature_dim      = feature_dim
-    _store.checkpoint_epoch = int(ckpt.get("epoch_npr", ckpt.get("epoch", 0)))
-    _store.load_time_s      = time.time() - t0
+    # Optional Layer 2 Anomaly Detector
+    try:
+        anomaly_detector = VideoAnomalyDetector(encoder=encoder, feature_dim=feature_dim)
+        if os.path.exists(CHECKPOINT_PATH):
+            anomaly_detector.load_state_dict(ckpt, strict=False)
+        anomaly_detector.eval()
+        _store.anomaly_detector = anomaly_detector
+        logger.info("  ✓ Loaded VideoAnomalyDetector")
+    except Exception as exc:
+        logger.warning("Could not initialise VideoAnomalyDetector: %s", exc)
 
-    logger.info(
-        "All 3 Cascade Layers ready (Layer 1: C2PA, Layer 2: Anomaly, Layer 3: RA-Det). Load time: %.1fs | Device: %s",
-        _store.load_time_s, device,
-    )
+    logger.info("Model loading complete in %.2fs", _store.load_time_s)
 
 
 # ===========================================================================
@@ -269,17 +285,6 @@ def preprocess_video(video_path: str) -> torch.Tensor:
 def run_inference(video_tensor: torch.Tensor) -> dict:
     """
     Execute the full RA-Det forward pass and return ALL raw signals.
-
-    Does NOT make a final real/fake decision — that is the endpoint's job.
-    Returns classifier probability, embedding score, and branch probabilities
-    so that the /predict endpoint can apply the user-selected decision mode.
-
-    Mirrors CrossGeneratorEvaluator.evaluate_decoder (video branch):
-      1. Clean embeddings  : encoder(video)
-      2. 3D noise          : decoder(video_c_first, clean_emb)
-      3. Noisy embeddings  : encoder(perturbed_video)
-      4. Temporal diff     : frame-to-frame delta, normalised, [B,C,T,H,W]
-      5. Classifier        : VideoEnsembleClassifier(use_max_for_eval=False)
     """
     device     = _store.device
     encoder    = _store.encoder
@@ -291,7 +296,11 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
     # Step 1 — Clean embeddings and NPR features
     with torch.no_grad():
         npr_features = extract_npr_features(video)        # [1, 48]
-        clean_emb = encoder(video)                    # [1, D]
+        if hasattr(encoder, "encode_video_detailed"):
+            clean_emb, per_frame_cls, _ = encoder.encode_video_detailed(video)
+        else:
+            clean_emb = encoder(video)                    # [1, D]
+            per_frame_cls = None
 
         # Step 2 — Spatiotemporal noise
         video_c_first = video.permute(0, 2, 1, 3, 4)  # [1, C, T, H, W]
@@ -319,21 +328,17 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
         cosine_sim = float(F.cosine_similarity(clean_emb, noisy_emb, dim=1).item())
         l2_val     = float(l2_dist.item())
     
-        # Step 6 — Classifier with trained logit_weighted fusion.
-        # NOTE: use_max_for_eval=False is critical.
-        # use_max_for_eval=True switches to MaxFusion which takes max probability
-        # across ALL branches — one overconfident branch (foundation=1.0) will
-        # poison the whole ensemble and classify everything as fake.
         outputs = classifier(
-            video            = video,
-            noise            = noise,
-            temporal_diff    = temporal_diff,
-            lpd_features     = None,      # 2D-LPD disabled in video mode
-            l2_distance      = l2_dist,
-            embedding_diff   = emb_diff,
-            npr_features     = npr_features,
-            clean_embedding  = clean_emb,  # DirectFeatureBranch anchor
-            use_max_for_eval = False,
+            video              = video,
+            noise              = noise,
+            temporal_diff      = temporal_diff,
+            lpd_features       = None,      # 2D-LPD disabled in video mode
+            l2_distance        = l2_dist,
+            embedding_diff     = emb_diff,
+            npr_features       = npr_features,
+            clean_embedding    = clean_emb,  # DirectFeatureBranch anchor
+            per_frame_features = per_frame_cls,
+            use_max_for_eval   = False,
         )
 
     if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):

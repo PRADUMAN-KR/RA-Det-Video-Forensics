@@ -1054,8 +1054,14 @@ class EmbeddingTrainer:
         self.world_size = world_size
         self.is_ddp = world_size > 1
         
-        # Check if running in video mode (using VideoMAEv2 model)
-        self.video_mode = "videomae" in model_name.lower() or "opengvlab" in model_name.lower() or "mcg-nju" in model_name.lower()
+        # Check if running in video mode
+        self.video_mode = (
+            "videomae" in model_name.lower()
+            or "opengvlab" in model_name.lower()
+            or "mcg-nju" in model_name.lower()
+            or "dinov2" in model_name.lower()
+            or (decoder_kwargs and decoder_kwargs.get("is_video_mode", False))
+        )
 
         self.decoder_type = decoder_type
         self.decoder_kwargs = decoder_kwargs or {}
@@ -1111,15 +1117,25 @@ class EmbeddingTrainer:
         # Setup logging
         self._setup_logging()
 
-        # Check if running in video mode (using VideoMAEv2 model)
-        self.video_mode = "videomae" in model_name.lower() or "opengvlab" in model_name.lower() or "mcg-nju" in model_name.lower()
-
         # Load video or image encoder
         if self.video_mode:
-            if self.rank == 0:
-                print(f"Loading VideoMAE encoder: {model_name}")
-            from models.video_encoder_wrapper import load_video_encoder
-            self.encoder = load_video_encoder(model_name=model_name, device=self.device)
+            if "dinov2" in model_name.lower():
+                if self.rank == 0:
+                    print(f"Loading DINOv2 Video encoder: {model_name}")
+                from models.dinov2_video_encoder import load_dinov2_video_encoder
+                self.encoder = load_dinov2_video_encoder(
+                    model_name=model_name,
+                    num_frames=self.decoder_kwargs.get("num_frames", 16),
+                    temporal_layers=self.decoder_kwargs.get("temporal_transformer_layers", 2),
+                    unfreeze_last_n=self.decoder_kwargs.get("unfreeze_last_n_blocks", 0),
+                    device=str(self.device),
+                )
+            else:
+                if self.rank == 0:
+                    print(f"Loading VideoMAE encoder: {model_name}")
+                from models.video_encoder_wrapper import load_video_encoder
+                self.encoder = load_video_encoder(model_name=model_name, device=self.device)
+
             self.feature_dim = self.encoder.output_dim
             
             class DummyTokenizer:
@@ -1153,10 +1169,13 @@ class EmbeddingTrainer:
         if self.rank == 0:
             print(f"Feature dimension: {self.feature_dim}")
 
-        # Freeze encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self.encoder.eval()
+        # Freeze encoder (unless handled internally e.g. DINOv2VideoEncoder)
+        if not hasattr(self.encoder, "dino"):
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            self.encoder.eval()
+        else:
+            self.encoder.eval()
 
         # Initialize decoder using factory (or 3D UNet if in video mode)
         if self.rank == 0:
@@ -1562,6 +1581,8 @@ class EmbeddingTrainer:
                         use_four_branch=self.use_four_branch_ensemble,
                         use_npr_branch=getattr(self, "use_npr_branch", True),
                         use_direct_feature_branch=True,
+                        use_temporal_coherence_branch=self.decoder_kwargs.get("use_temporal_coherence_branch", True),
+                        num_frames=self.decoder_kwargs.get("num_frames", 16),
                     ).to(self.device)
                 else:
                     # Use EnsembleClassifier with foundation + scratch branches
@@ -1625,11 +1646,12 @@ class EmbeddingTrainer:
                 else:
                     self.classifier = classifier
 
-            # Get classifier parameters
+            # Get classifier parameters (including any trainable encoder parameters)
+            encoder_trainable = [p for p in self.encoder.parameters() if p.requires_grad]
             if self.is_ddp:
-                classifier_params = self.classifier.module.parameters()
+                classifier_params = list(self.classifier.module.parameters()) + encoder_trainable
             else:
-                classifier_params = self.classifier.parameters()
+                classifier_params = list(self.classifier.parameters()) + encoder_trainable
 
             # Separate optimizers for decoder and classifier
             self.decoder_optimizer = torch.optim.AdamW(
@@ -1698,7 +1720,7 @@ class EmbeddingTrainer:
             )
             self.classifier_optimizer = torch.optim.AdamW(
                 classifier_params,
-                lr=self.lr,
+                lr=self.lr,  # Can use different LR if needed
                 weight_decay=self.weight_decay
             )
 
@@ -1737,6 +1759,8 @@ class EmbeddingTrainer:
         self.decoder.train()
         if self.classifier is not None:
             self.classifier.train()
+        
+        # Keep encoder in eval mode for normalization layers, but allow parameter updates if requires_grad
         self.encoder.eval()
 
         # Set epoch for distributed sampler
@@ -1780,8 +1804,12 @@ class EmbeddingTrainer:
                 video_c_first = video.permute(0, 2, 1, 3, 4)
 
                 # 1. Clean embedding
-                with torch.no_grad():
-                    clean_embeddings = self.encoder(video)
+                if hasattr(self.encoder, "encode_video_detailed"):
+                    clean_embeddings, per_frame_cls, _ = self.encoder.encode_video_detailed(video)
+                else:
+                    with torch.no_grad():
+                        clean_embeddings = self.encoder(video)
+                    per_frame_cls = None
 
                 # 2. Generate spatiotemporal noise
                 noise = self.decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
@@ -1882,6 +1910,7 @@ class EmbeddingTrainer:
                         "l2_distance": torch.norm(clean_embeddings - noisy_embeddings, p=2, dim=1, keepdim=True),
                         "embedding_diff": clean_embeddings - noisy_embeddings,
                         "clean_embedding": clean_embeddings,   # DirectFeatureBranch anchor
+                        "per_frame_features": per_frame_cls,
                         "npr_features": extract_npr_features(video) if hasattr(self, '_use_npr') else None,
                     }
 

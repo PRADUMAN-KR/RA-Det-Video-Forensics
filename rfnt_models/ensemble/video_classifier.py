@@ -6,6 +6,7 @@ Extends the generic FlexibleEnsembleClassifier for 3D spatiotemporal video/deepf
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Dict, Tuple, Union, Optional
 from .classifier import FlexibleEnsembleClassifier
 from .base import BaseBranch
@@ -144,6 +145,102 @@ class VideoNPRBranch(BaseBranch):
         return ["npr_features"]
 
 
+class TemporalCoherenceBranch(BaseBranch):
+    """
+    Temporal coherence branch that detects temporal artifacts from per-frame features.
+
+    Takes per-frame CLS tokens [B, T, D] from DINOv2 and computes:
+      - Frame-to-frame cosine similarity sequence → variance (flickering signal)
+      - Temporal drift (1st derivative of embeddings)
+      - Temporal jerk (2nd derivative — motion discontinuities)
+      - Cosine similarity statistics (mean, std, min)
+
+    These temporal statistics are far more discriminative for video deepfakes than
+    any spatial-only feature: AI-generated videos have characteristic temporal
+    inconsistencies that real camera footage does not.
+    """
+
+    def __init__(
+        self,
+        name: str = "temporal_coherence",
+        feature_dim: int = 1024,
+        num_frames: int = 16,
+        hidden_dims: List[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__(name)
+        if hidden_dims is None:
+            hidden_dims = [256, 128]
+
+        # Input features:
+        #   - 3 cosine-sim statistics (mean, std, min)
+        #   - D-dim drift magnitude features (projected to 64)
+        #   - D-dim jerk magnitude features (projected to 64)
+        #   Total = 3 + 64 + 64 = 131
+        self.drift_proj = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+        )
+        self.jerk_proj = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+        )
+
+        input_dim = 3 + 64 + 64  # cosine stats + drift + jerk
+
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, 1))
+
+        self.classifier = nn.Sequential(*layers)
+
+    def forward(self, **kwargs) -> torch.Tensor:
+        per_frame_features = kwargs.get("per_frame_features")
+        if per_frame_features is None:
+            raise ValueError("TemporalCoherenceBranch requires 'per_frame_features' [B, T, D]")
+
+        B, T, D = per_frame_features.shape
+
+        # Frame-to-frame cosine similarity: [B, T-1]
+        frame_sims = F.cosine_similarity(
+            per_frame_features[:, 1:], per_frame_features[:, :-1], dim=-1
+        )
+
+        # Cosine similarity statistics — key discriminative features
+        sim_mean = frame_sims.mean(dim=1, keepdim=True)   # [B, 1]
+        sim_std = frame_sims.std(dim=1, keepdim=True)     # [B, 1]
+        sim_min = frame_sims.min(dim=1, keepdim=True)[0]  # [B, 1]
+        cosine_stats = torch.cat([sim_mean, sim_std, sim_min], dim=1)  # [B, 3]
+
+        # Temporal drift (1st derivative)
+        drift = (per_frame_features[:, 1:] - per_frame_features[:, :-1]).mean(dim=1)  # [B, D]
+        drift_feat = self.drift_proj(drift)  # [B, 64]
+
+        # Temporal jerk (2nd derivative)
+        jerk = (
+            per_frame_features[:, 2:]
+            - 2 * per_frame_features[:, 1:-1]
+            + per_frame_features[:, :-2]
+        ).mean(dim=1)  # [B, D]
+        jerk_feat = self.jerk_proj(jerk)  # [B, 64]
+
+        combined = torch.cat([cosine_stats, drift_feat, jerk_feat], dim=1)  # [B, 131]
+        return self.classifier(combined).reshape(-1, 1)
+
+    def get_input_keys(self) -> List[str]:
+        return ["per_frame_features"]
+
+
 class DirectFeatureBranch(BaseBranch):
     """
     Anchor branch: classifies directly from the frozen VideoMAE CLS embedding.
@@ -223,7 +320,9 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                  fusion_method: str = "logit_weighted",
                  use_four_branch: bool = True,
                  use_npr_branch: bool = False,
-                 use_direct_feature_branch: bool = True):
+                 use_direct_feature_branch: bool = True,
+                 use_temporal_coherence_branch: bool = False,
+                 num_frames: int = 16):
         super().__init__(fusion_method=fusion_method, temperature=temperature)
         
         self.video_encoder = video_encoder
@@ -294,6 +393,20 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             )
             self.register_branch(direct_branch)
 
+        if use_temporal_coherence_branch:
+            # 7. TemporalCoherence Branch — detects temporal artifacts from
+            # per-frame DINOv2 CLS tokens. Captures flickering, motion
+            # discontinuities, and embedding drift that are characteristic
+            # of AI-generated videos.
+            temporal_branch = TemporalCoherenceBranch(
+                name="temporal_coherence",
+                feature_dim=feature_dim,
+                num_frames=num_frames,
+                hidden_dims=[256, 128],
+                dropout=dropout
+            )
+            self.register_branch(temporal_branch)
+
     def forward(self,
                 video: torch.Tensor,
                 noise: torch.Tensor,
@@ -303,20 +416,22 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
                 embedding_diff: Optional[torch.Tensor] = None,
                 npr_features: Optional[torch.Tensor] = None,
                 clean_embedding: Optional[torch.Tensor] = None,
+                per_frame_features: Optional[torch.Tensor] = None,
                 use_max_for_eval: bool = False,
                 **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Overridden forward to run the generic FlexibleEnsembleClassifier routing.
 
         Args:
-            video:           [B, T, C, H, W]  - original video frames (T-first for VideoMAE).
-            noise:           [B, C, T, H, W]  - 3D UNet adversarial noise.
-            temporal_diff:   [B, C, T, H, W]  - frame-to-frame difference (motion signal).
-            lpd_features:    [B, C, T, H, W]  - optional, 2D-LPD features (None in video mode).
-            l2_distance:     [B, 1]           - L2 norm of embedding delta.
-            embedding_diff:  [B, D]           - element-wise embedding delta.
-            npr_features:    [B, 48]          - NPR pixel-relation features.
-            clean_embedding: [B, D]           - raw frozen VideoMAE CLS embedding (anchor branch).
+            video:              [B, T, C, H, W]  - original video frames (T-first for encoder).
+            noise:              [B, C, T, H, W]  - 3D UNet adversarial noise.
+            temporal_diff:      [B, C, T, H, W]  - frame-to-frame difference (motion signal).
+            lpd_features:       [B, C, T, H, W]  - optional, 2D-LPD features (None in video mode).
+            l2_distance:        [B, 1]           - L2 norm of embedding delta.
+            embedding_diff:     [B, D]           - element-wise embedding delta.
+            npr_features:       [B, 48]          - NPR pixel-relation features.
+            clean_embedding:    [B, D]           - raw frozen encoder CLS embedding (anchor branch).
+            per_frame_features: [B, T, D]        - per-frame CLS tokens (temporal coherence branch).
         """
         inputs = {
             "video": video,
@@ -327,6 +442,7 @@ class VideoEnsembleClassifier(FlexibleEnsembleClassifier):
             "embedding_diff": embedding_diff,
             "npr_features": npr_features,
             "clean_embedding": clean_embedding,
+            "per_frame_features": per_frame_features,
         }
 
         # Route to base implementation

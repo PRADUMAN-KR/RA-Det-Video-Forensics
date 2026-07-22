@@ -113,6 +113,51 @@ EXPERIMENT_CONFIGS = {
         "checkpoint_dir": "./checkpoints/genbuster_kinetics_v2",
         "save_every": 1,
     },
+
+    "dinov2_temporal_v1": {
+        "name": "dinov2_temporal_v1",
+        "model_name": "facebook/dinov2-large",
+
+        "decoder_type": "unet",
+        "decoder_kwargs": {
+            "strategy_channels": 0,
+            "base_channels": 64,
+            "num_levels": 5,
+            "num_heads": 8,
+            "use_attention": True,
+            "bottleneck_size": 14,
+            "use_temporal_coherence_branch": True,
+            "temporal_transformer_layers": 2,
+            "unfreeze_last_n_blocks": 2,
+            "num_frames": 16,
+            "is_video_mode": True,
+        },
+
+        "attack_eps": 16/255,
+        "eps_randomization": True,
+        "eps_min": 4/255,
+        "eps_max": 32/255,
+        "eps_schedule": "random",
+
+        "lr": 5e-5,
+        "weight_decay": 0.01,
+        "niter": 20,
+        "batch_size": 4,  # Optimized for RTX 5090 (32GB VRAM)
+
+        "training_mode": "ensemble",
+        "lambda_classification": 1.0,
+
+        "loss_type": "discrepancy",
+        "margin": 1.0,
+        "normalize_loss": True,
+        "fusion_method": "learned_weight",
+        "use_four_branch_ensemble": True,
+        "use_npr_branch": True,
+
+        "progan_train_data_path": "./data",
+        "checkpoint_dir": "./checkpoints/dinov2_temporal_v1",
+        "save_every": 1,
+    },
 }
 
 
