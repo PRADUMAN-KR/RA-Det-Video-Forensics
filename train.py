@@ -567,6 +567,7 @@ def train(config):
     # Resume from checkpoint if specified
     start_epoch = 1
     best_val_similarity = float('inf')  # Lower is better (we want to minimize similarity)
+    best_val_score = 0.0               # Higher is better (for AUC metric in ensemble mode)
     if config.get('resume_checkpoint'):
         trainer.load_checkpoint(config['resume_checkpoint'])
         start_epoch = trainer.current_epoch + 1
@@ -618,16 +619,29 @@ def train(config):
 
         # Save best model and check early stopping
         if rank == 0:
-            current_val_similarity = val_metrics.get('val/similarity', float('inf'))
-            if current_val_similarity < best_val_similarity:
-                best_val_similarity = current_val_similarity
-                trainer.best_val_similarity = best_val_similarity
+            use_auc = 'val/auc' in val_metrics and config.get('training_mode') == 'ensemble'
+            if use_auc:
+                current_score = val_metrics['val/auc']
+                is_best = current_score > best_val_score if 'best_val_score' in locals() else True
+                metric_name = "AUC"
+            else:
+                current_score = val_metrics.get('val/similarity', float('inf'))
+                is_best = current_score < best_val_similarity
+                metric_name = "similarity"
+
+            if is_best:
+                if use_auc:
+                    best_val_score = current_score
+                else:
+                    best_val_similarity = current_score
+                    trainer.best_val_similarity = best_val_similarity
+
                 trainer.save_checkpoint(epoch, filename="checkpoint_best.pt")
-                print(f"  New best model saved! (similarity: {best_val_similarity:.4f})")
+                print(f"  ★ New best model saved to checkpoint_best.pt! ({metric_name}: {current_score:.4f})")
                 patience_counter = 0
             else:
                 patience_counter += 1
-                print(f"  No improvement in validation similarity for {patience_counter} epochs.")
+                print(f"  No improvement in validation {metric_name} for {patience_counter} epochs.")
 
         # Broadcast early stopping decision in DDP
         early_stop = torch.tensor(1.0 if (rank == 0 and patience_counter >= patience) else 0.0, device=device)

@@ -557,7 +557,7 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
         Returns:
             Dictionary mapping generator names to metrics
         """
-        from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score, average_precision_score
+        from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score, average_precision_score, precision_score, recall_score, f1_score, confusion_matrix
 
         encoder.eval()
         decoder.eval()
@@ -918,13 +918,24 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                 real_mask = gen_labels == 0
                 fake_mask = gen_labels == 1
 
-                # Calculate AUC, average precision, and optimal accuracy using classifier probabilities
+                # Calculate AUC, average precision, precision, recall, f1, confusion matrix, and optimal accuracy using classifier probabilities
                 try:
                     auc = roc_auc_score(gen_labels, gen_probs)
                     ap = average_precision_score(gen_labels, gen_probs)
 
+                    # Standard threshold (0.5) metrics & Confusion Matrix
+                    pred_labels_05 = [int(prob >= 0.5) for prob in gen_probs]
+                    prec_05 = precision_score(gen_labels, pred_labels_05, zero_division=0)
+                    rec_05 = recall_score(gen_labels, pred_labels_05, zero_division=0)
+                    f1_05 = f1_score(gen_labels, pred_labels_05, zero_division=0)
+
+                    cm = confusion_matrix(gen_labels, pred_labels_05, labels=[0, 1])
+                    tn, fp, fn, tp = [int(v) for v in cm.ravel()]
+                    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+                    fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+
                     # Calculate optimal accuracy by finding best threshold
-                    fpr, tpr, thresholds = roc_curve(gen_labels, gen_probs)
+                    fpr_curve, tpr_curve, thresholds = roc_curve(gen_labels, gen_probs)
                     accuracies = []
                     for threshold in thresholds:
                         predictions = [(prob >= threshold) for prob in gen_probs]
@@ -934,14 +945,26 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     if accuracies:
                         optimal_acc = max(accuracies)
                         optimal_threshold = thresholds[accuracies.index(optimal_acc)]
+                        opt_preds = [(prob >= optimal_threshold) for prob in gen_probs]
+                        optimal_prec = precision_score(gen_labels, opt_preds, zero_division=0)
+                        optimal_rec = recall_score(gen_labels, opt_preds, zero_division=0)
                     else:
                         optimal_acc = 0.0
-                        optimal_threshold = 0.0
+                        optimal_threshold = 0.5
+                        optimal_prec = 0.0
+                        optimal_rec = 0.0
                 except:
                     auc = 0.0
                     ap = 0.0
+                    prec_05 = 0.0
+                    rec_05 = 0.0
+                    f1_05 = 0.0
+                    tn, fp, fn, tp = 0, 0, 0, 0
+                    fpr, fnr = 0.0, 0.0
                     optimal_acc = 0.0
-                    optimal_threshold = 0.0
+                    optimal_threshold = 0.5
+                    optimal_prec = 0.0
+                    optimal_rec = 0.0
 
                 metrics = {
                     'mean_similarity': float(np.mean(gen_sims)),
@@ -949,7 +972,18 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     'mean_l2_distance': float(np.mean(gen_l2)),
                     'auc': float(auc),
                     'average_precision': float(ap),
+                    'precision': float(prec_05),
+                    'recall': float(rec_05),
+                    'f1_score': float(f1_05),
+                    'tn': tn,
+                    'fp': fp,
+                    'fn': fn,
+                    'tp': tp,
+                    'fpr': fpr,
+                    'fnr': fnr,
                     'optimal_accuracy': float(optimal_acc),
+                    'optimal_precision': float(optimal_prec),
+                    'optimal_recall': float(optimal_rec),
                     'optimal_threshold': float(optimal_threshold),
                     'num_samples': len(indices)
                 }
@@ -2417,12 +2451,19 @@ class EmbeddingTrainer:
             all_l2_distances = [m['mean_l2_distance'] for m in generator_metrics.values()]
             all_aucs = [m['auc'] for m in generator_metrics.values()]
             all_aps = [m['average_precision'] for m in generator_metrics.values()]
+            all_precs = [m['precision'] for m in generator_metrics.values() if 'precision' in m]
+            all_recs = [m['recall'] for m in generator_metrics.values() if 'recall' in m]
+            all_f1s = [m['f1_score'] for m in generator_metrics.values() if 'f1_score' in m]
             all_opt_accs = [m['optimal_accuracy'] for m in generator_metrics.values()]
 
             metrics['val/similarity'] = sum(all_similarities) / len(all_similarities)
             metrics['val/l2_distance'] = sum(all_l2_distances) / len(all_l2_distances)
             metrics['val/auc'] = sum(all_aucs) / len(all_aucs)
             metrics['val/average_precision'] = sum(all_aps) / len(all_aps)
+            if all_precs:
+                metrics['val/precision'] = sum(all_precs) / len(all_precs)
+                metrics['val/recall'] = sum(all_recs) / len(all_recs)
+                metrics['val/f1_score'] = sum(all_f1s) / len(all_f1s)
             metrics['val/optimal_accuracy'] = sum(all_opt_accs) / len(all_opt_accs)
 
             # Aggregate real/fake similarities if available
@@ -2438,15 +2479,43 @@ class EmbeddingTrainer:
                 metrics['val/similarity_fake'] = sum(fake_sims) / len(fake_sims)
                 metrics['val/l2_distance_fake'] = sum(fake_l2s) / len(fake_l2s)
 
-            # Print per-generator metrics on rank 0
+            # Aggregate confusion matrix totals
+            total_tn = sum(m.get('tn', 0) for m in generator_metrics.values())
+            total_fp = sum(m.get('fp', 0) for m in generator_metrics.values())
+            total_fn = sum(m.get('fn', 0) for m in generator_metrics.values())
+            total_tp = sum(m.get('tp', 0) for m in generator_metrics.values())
+            total_samples = total_tn + total_fp + total_fn + total_tp
+
+            metrics['val/tn'] = total_tn
+            metrics['val/fp'] = total_fp
+            metrics['val/fn'] = total_fn
+            metrics['val/tp'] = total_tp
+            metrics['val/fpr'] = float(total_fp / (total_fp + total_tn)) if (total_fp + total_tn) > 0 else 0.0
+            metrics['val/fnr'] = float(total_fn / (total_fn + total_tp)) if (total_fn + total_tp) > 0 else 0.0
+
+            # Print per-generator metrics and full confusion matrix on rank 0
             if self.rank == 0:
+                print(f"\n{'='*55}")
+                print(f"CONFUSION MATRIX SUMMARY (Epoch {epoch}) — Total Samples: {total_samples}")
+                print(f"{'='*55}")
+                print(f"                      Predicted REAL    Predicted FAKE")
+                print(f"  Actual REAL (0):   TN = {total_tn:<12} FP = {total_fp:<12}")
+                print(f"  Actual FAKE (1):   FN = {total_fn:<12} TP = {total_tp:<12}")
+                print(f"{'-'*55}")
+                print(f"  False Positive Rate (FPR): {metrics['val/fpr'] * 100:.2f}% ({total_fp}/{total_fp + total_tn if total_fp + total_tn > 0 else 1})")
+                print(f"  False Negative Rate (FNR): {metrics['val/fnr'] * 100:.2f}% ({total_fn}/{total_fn + total_tp if total_fn + total_tp > 0 else 1})")
+                print(f"{'='*55}")
+
                 print(f"\nPer-Generator Validation Metrics (Epoch {epoch}):")
                 for gen, gen_metrics in sorted(generator_metrics.items()):
                     print(f"  {gen}:")
                     print(f"    similarity: {gen_metrics['mean_similarity']:.4f} (std: {gen_metrics['std_similarity']:.4f})")
                     print(f"    l2_distance: {gen_metrics['mean_l2_distance']:.4f}")
-                    print(f"    auc: {gen_metrics['auc']:.4f}")
-                    print(f"    average_precision: {gen_metrics['average_precision']:.4f}")
+                    print(f"    auc: {gen_metrics['auc']:.4f} | average_precision: {gen_metrics['average_precision']:.4f}")
+                    if 'precision' in gen_metrics:
+                        print(f"    precision: {gen_metrics['precision']:.4f} | recall: {gen_metrics['recall']:.4f} | f1: {gen_metrics['f1_score']:.4f}")
+                    if 'tp' in gen_metrics:
+                        print(f"    matrix: TN={gen_metrics['tn']}, FP={gen_metrics['fp']}, FN={gen_metrics['fn']}, TP={gen_metrics['tp']}")
                     print(f"    optimal_accuracy: {gen_metrics['optimal_accuracy']:.4f}")
 
                     if 'similarity_real' in gen_metrics:
