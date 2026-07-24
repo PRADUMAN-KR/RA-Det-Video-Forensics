@@ -125,11 +125,15 @@ EXPERIMENT_CONFIGS = {
             "num_levels": 5,
             "num_heads": 8,
             "use_attention": True,
-            "bottleneck_size": 14,
+            # bottleneck_size=7 (was 14): EmbeddingEncoder3D projects to H×W spatial grid.
+            # 14×14 = 196 tokens → 7×7 = 49 tokens: saves 4× memory in cross-attention.
+            "bottleneck_size": 7,
             "use_temporal_coherence_branch": True,
             "temporal_transformer_layers": 2,
-            "unfreeze_last_n_blocks": 2,
-            "num_frames": 16,
+            "unfreeze_last_n_blocks": 4,
+            # num_frames=8 (was 16): halves the temporal video tensor size.
+            # Use 16 only if OOM is resolved after other optimisations.
+            "num_frames": 8,
             "is_video_mode": True,
         },
 
@@ -142,7 +146,10 @@ EXPERIMENT_CONFIGS = {
         "lr": 5e-5,
         "weight_decay": 0.01,
         "niter": 20,
-        "batch_size": 4,  # Optimized for RTX 5090 (32GB VRAM)
+        # batch_size=2: safe default with AMP + double decoder pass on 32 GB VRAM.
+        # Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in your env
+        # to reduce fragmentation if you see OOM at the very first batch.
+        "batch_size": 2,
 
         "training_mode": "ensemble",
         "lambda_classification": 1.0,

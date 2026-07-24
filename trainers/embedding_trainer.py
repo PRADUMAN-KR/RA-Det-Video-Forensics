@@ -666,13 +666,24 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     td_max = temporal_diff.abs().amax(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
                     temporal_diff = temporal_diff / td_max
 
+                    # Compute per-frame features and NPR features for video branches
+                    if hasattr(self.encoder, "encode_video_detailed"):
+                        _, per_frame_cls_eval, _ = self.encoder.encode_video_detailed(video)
+                    else:
+                        per_frame_cls_eval = None
+
+                    npr_features_eval = extract_npr_features(video)
+
                     inputs = {
                         "video": video,
                         "noise": noise,
                         "temporal_diff": temporal_diff,
                         "lpd_features": None,
                         "l2_distance": l2_dist.unsqueeze(1),
-                        "embedding_diff": clean_embeddings - noisy_embeddings
+                        "embedding_diff": clean_embeddings - noisy_embeddings,
+                        "clean_embedding": clean_embeddings,
+                        "per_frame_features": per_frame_cls_eval,
+                        "npr_features": npr_features_eval,
                     }
 
                     outputs = classifier_model(use_max_for_eval=True, **inputs)
@@ -685,8 +696,8 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     cls_probs = torch.sigmoid(ensemble_logits.squeeze(-1))
                     local_probs.extend(cls_probs.cpu().numpy())
 
-                    for branch_name, branch_logits in branch_logits.items():
-                        branch_probs = torch.sigmoid(branch_logits.squeeze(-1))
+                    for branch_name, b_logits in branch_logits.items():
+                        branch_probs = torch.sigmoid(b_logits.reshape(-1))
                         if branch_name == "foundation":
                             local_foundation_probs.extend(branch_probs.cpu().numpy())
                         elif branch_name == "scratch":
@@ -1078,6 +1089,7 @@ class EmbeddingTrainer:
         use_four_branch_ensemble: bool = False,  # Use 4-branch ensemble (foundation, scratch, l2, embedding_diff)
         noise_embedding_use_l2: bool = False,  # Add L2-distance branch to noise_embedding_classifier
         embedding_loss_weight: float = 1.0,  # Weight for embedding loss
+        use_amp: bool = True,  # Enable BF16/FP16 mixed-precision training (set False for FP32)
     ):
         self.model_name = model_name
         self.eps = eps
@@ -1219,11 +1231,16 @@ class EmbeddingTrainer:
 
         if self.video_mode:
             from models.unet_3d import UNetDecoder3D
-            # Video mode uses UNetDecoder3D
+            # Video mode uses UNetDecoder3D — filter out trainer-specific kwargs
+            valid_unet_keys = {
+                "embed_dim", "strategy_channels", "base_channels",
+                "num_levels", "num_heads", "use_attention", "eps", "bottleneck_size"
+            }
+            unet_kwargs = {k: v for k, v in self.decoder_kwargs.items() if k in valid_unet_keys}
             self.decoder = UNetDecoder3D(
                 embed_dim=self.feature_dim,
                 eps=eps,
-                **self.decoder_kwargs
+                **unet_kwargs
             ).to(self.device)
         else:
             self.decoder = create_decoder(
@@ -1257,6 +1274,21 @@ class EmbeddingTrainer:
         # Training state
         self.current_epoch = 0
         self.global_step = 0
+
+        # Mixed-precision training (BF16 AMP) — cuts activation memory ~50%
+        # Pass use_amp=False (via --no-amp) to run in full FP32 for debugging.
+        bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        self.use_amp = use_amp and torch.cuda.is_available()
+        self._amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+        # GradScaler is only needed for FP16 (BF16 has same exponent range as FP32, no underflow).
+        # When use_amp=False (FP32), enabled=False makes it a transparent no-op.
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp and not bf16_ok)
+        if self.rank == 0:
+            if self.use_amp:
+                amp_tag = "BF16" if bf16_ok else "FP16"
+                print(f"  Mixed-precision training: enabled ({amp_tag})")
+            else:
+                print(f"  Mixed-precision training: DISABLED (FP32 mode — uses ~2x VRAM)")
 
     def _setup_logging(self):
         """
@@ -1784,6 +1816,42 @@ class EmbeddingTrainer:
         # For backward compatibility
         self.optimizer = self.decoder_optimizer
 
+        # ── CosineAnnealingLR schedulers ──────────────────────────────
+        # T_max is set later via setup_schedulers() once niter is known.
+        self.decoder_scheduler = None
+        self.classifier_scheduler = None
+
+    def setup_schedulers(self, niter: int):
+        """
+        Initialise CosineAnnealingLR schedulers for all optimizers.
+
+        Call this AFTER setup_training_mode() and BEFORE the training loop so
+        that T_max = niter is known.  The schedulers are stepped automatically
+        at the end of every epoch inside train_epoch().
+
+        Args:
+            niter: total number of training epochs (T_max for cosine schedule)
+        """
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+
+        if self.decoder_optimizer is not None:
+            self.decoder_scheduler = CosineAnnealingLR(
+                self.decoder_optimizer,
+                T_max=niter,
+                eta_min=1e-7   # floor LR – prevents complete freeze near the end
+            )
+            if self.rank == 0:
+                print(f"  Decoder scheduler: CosineAnnealingLR(T_max={niter}, eta_min=1e-7)")
+
+        if self.classifier_optimizer is not None:
+            self.classifier_scheduler = CosineAnnealingLR(
+                self.classifier_optimizer,
+                T_max=niter,
+                eta_min=1e-7
+            )
+            if self.rank == 0:
+                print(f"  Classifier scheduler: CosineAnnealingLR(T_max={niter}, eta_min=1e-7)")
+
     def train_epoch(
         self,
         train_loader: DataLoader,
@@ -1837,159 +1905,174 @@ class EmbeddingTrainer:
                 # Permute for 3D Conv: [B, C, T, H, W]
                 video_c_first = video.permute(0, 2, 1, 3, 4)
 
-                # 1. Clean embedding
-                if hasattr(self.encoder, "encode_video_detailed"):
-                    clean_embeddings, per_frame_cls, _ = self.encoder.encode_video_detailed(video)
-                else:
+                self.decoder_optimizer.zero_grad(set_to_none=True)
+                if self.classifier_optimizer is not None:
+                    self.classifier_optimizer.zero_grad(set_to_none=True)
+
+                with torch.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self.use_amp):
+
+                    # 1. Clean embedding (encoder already has @autocast decorator;
+                    #    wrap anyway so the downstream computation is also BF16)
+                    if hasattr(self.encoder, "encode_video_detailed"):
+                        clean_embeddings, per_frame_cls, _ = self.encoder.encode_video_detailed(video)
+                    else:
+                        with torch.no_grad():
+                            clean_embeddings = self.encoder(video)
+                        per_frame_cls = None
+
+                    # 2. First decoder pass — bottleneck self-attends on clean embedding
+                    noise = self.decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
+
+                    # 3. Noisy embedding (stop-grad: we don't want to backprop through
+                    #    the encoder a second time — saves one full backward pass)
                     with torch.no_grad():
-                        clean_embeddings = self.encoder(video)
-                    per_frame_cls = None
+                        perturbed_video = (video_c_first + noise.detach()).permute(0, 2, 1, 3, 4)
+                        noisy_embeddings_ref = self.encoder(perturbed_video).detach()
 
-                # 2. Generate spatiotemporal noise
-                noise = self.decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
+                    # 4. Second decoder pass — bottleneck now contrasts clean vs perturbed
+                    noise = self.decoder(
+                        original_video=video_c_first,
+                        clean_embedding=clean_embeddings,
+                        noisy_embedding=noisy_embeddings_ref,
+                    )
 
-                # 3. Noisy embedding
-                perturbed_video = (video_c_first + noise).permute(0, 2, 1, 3, 4)
-                noisy_embeddings = self.encoder(perturbed_video)
+                    # 5. Final noisy embedding for loss computation (needs grad for
+                    #    embedding discrepancy signal to reach the decoder)
+                    perturbed_video_grad = (video_c_first + noise).permute(0, 2, 1, 3, 4)
+                    noisy_embeddings = self.encoder(perturbed_video_grad)
 
-                # Compute cosine similarity
-                embedding_similarity = F.cosine_similarity(clean_embeddings, noisy_embeddings, dim=1)
+                    # Compute cosine similarity
+                    embedding_similarity = F.cosine_similarity(
+                        clean_embeddings.float(), noisy_embeddings.float(), dim=1
+                    )
 
-                # 4. Compute embedding loss based on loss_type
-                if self.loss_type == "similarity":
-                    embedding_loss = embedding_similarity.mean()
-                elif self.loss_type == "discrepancy":
+                    # 6. Embedding loss
+                    if self.loss_type == "similarity":
+                        embedding_loss = embedding_similarity.mean()
+                    elif self.loss_type == "discrepancy":
+                        if labels is not None:
+                            mask_real = (labels == 0)
+                            mask_fake = (labels == 1)
+
+                            real_similarity = embedding_similarity[mask_real].mean() if mask_real.any() else torch.tensor(0.0, device=self.device)
+                            fake_similarity = embedding_similarity[mask_fake].mean() if mask_fake.any() else torch.tensor(0.0, device=self.device)
+
+                            if self.normalize_loss:
+                                min_margin_floor = 0.05
+                                scale = (1 - real_similarity + 1e-6).clamp(min=min_margin_floor)
+                                normalized_margin = self.margin * scale
+                                embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / scale
+                            else:
+                                embedding_loss = F.relu((fake_similarity - real_similarity) + self.margin)
+
+                            if fake_similarity > 0.99 and mask_fake.any():
+                                emb_dim = float(clean_embeddings.shape[-1])
+                                l1_kickstart = F.pairwise_distance(
+                                    clean_embeddings[mask_fake].float(),
+                                    noisy_embeddings[mask_fake].float(), p=1
+                                ).mean() / emb_dim
+                                embedding_loss = embedding_loss - 0.5 * l1_kickstart
+                        else:
+                            embedding_loss = embedding_similarity.mean()
+                    else:
+                        raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+                    # Track metrics
+                    total_similarity += embedding_similarity.mean().item()
+                    num_real = 0
+                    num_fake = 0
                     if labels is not None:
+                        num_real = (labels == 0).sum().item()
+                        num_fake = (labels == 1).sum().item()
+
                         mask_real = (labels == 0)
                         mask_fake = (labels == 1)
 
-                        real_similarity = embedding_similarity[mask_real].mean() if mask_real.any() else torch.tensor(0.0, device=self.device)
-                        fake_similarity = embedding_similarity[mask_fake].mean() if mask_fake.any() else torch.tensor(0.0, device=self.device)
-
-                        if self.normalize_loss:
-                            # BUG FIX: VideoMAE produces real_similarity ≈ 0.99, making
-                            # normalized_margin = margin × (1 - 0.99) = 0.001 — trivially
-                            # satisfied, so embedding_loss was always 0 throughout training.
-                            # Floor at 0.05 to guarantee a meaningful minimum margin even
-                            # when the encoder's embedding space is very tight (cosine sim → 1).
-                            min_margin_floor = 0.05
-                            scale = (1 - real_similarity + 1e-6).clamp(min=min_margin_floor)
-                            normalized_margin = self.margin * scale
-                            embedding_loss = F.relu((fake_similarity - real_similarity) + normalized_margin) / scale
-                        else:
-                            embedding_loss = F.relu((fake_similarity - real_similarity) + self.margin)
-
-                        # Gradient kickstart when both similarities are near 1.0.
-                        # Cosine similarity has near-zero gradient at the poles. Use L1
-                        # distance to inject a gradient signal and pull fake embeddings away.
-                        # Use dimension-normalised L1 to stay scale-invariant across encoders:
-                        # VideoMAE-Large is 1024-dim, so raw L1 ≈ 20-30× larger than CLIP/DINOv3.
-                        # A fixed coefficient of 0.1 made the term dominate and produce
-                        # negative total losses. Normalise by embedding dimension instead.
-                        if fake_similarity > 0.99 and mask_fake.any():
-                            emb_dim = float(clean_embeddings.shape[-1])
-                            l1_kickstart = F.pairwise_distance(
-                                clean_embeddings[mask_fake], noisy_embeddings[mask_fake], p=1
-                            ).mean() / emb_dim   # Per-dimension L1: always in [0, 2] range
-                            embedding_loss = embedding_loss - 0.5 * l1_kickstart
+                        if mask_real.any():
+                            self._last_real_similarity = embedding_similarity[mask_real].mean().item()
+                        if mask_fake.any():
+                            self._last_fake_similarity = embedding_similarity[mask_fake].mean().item()
                     else:
-                        embedding_loss = embedding_similarity.mean()
-                else:
-                    raise ValueError(f"Unknown loss_type: {self.loss_type}")
+                        self._last_real_similarity = 0.0
+                        self._last_fake_similarity = 0.0
 
-                # Track metrics
-                total_similarity = embedding_similarity.mean().item()
-                num_real = 0
-                num_fake = 0
-                if labels is not None:
-                    num_real = (labels == 0).sum().item()
-                    num_fake = (labels == 1).sum().item()
-
-                    mask_real = (labels == 0)
-                    mask_fake = (labels == 1)
-
-                    if mask_real.any():
-                        self._last_real_similarity = embedding_similarity[mask_real].mean().item()
-                    if mask_fake.any():
-                        self._last_fake_similarity = embedding_similarity[mask_fake].mean().item()
-                else:
-                    self._last_real_similarity = 0.0
-                    self._last_fake_similarity = 0.0
-
-                # Classification loss
-                classification_loss = torch.tensor(0.0, device=self.device)
-                batch_accuracy = 0.0
-                if labels is not None and self.training_mode == "ensemble":
-                    # NOTE: LPD strategy is 2D-only; skip it in video mode to avoid channel mismatch
-                    lpd_features = None
-
-                    # Compute temporal difference frames: captures motion inconsistencies in AI-generated video
-                    # video is [B, T, C, H, W]; diff across T dim, pad last frame to keep T consistent
-                    frame_diffs = video[:, 1:] - video[:, :-1]                      # [B, T-1, C, H, W]
-                    frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)  # [B, T,   C, H, W]
-                    temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous() # [B, C, T, H, W]
-                    # Normalise temporal difference to [-1, 1] for stable gradients.
-                    # Use 3-sigma normalisation instead of max-normalisation:
-                    # max-normalisation amplifies noise to ±1 for near-static clips
-                    # (common in Kinetics-400) where td_max ≈ 1e-6. 3-sigma is robust
-                    # to any motion magnitude and produces well-scaled features.
-                    td_std = temporal_diff.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-4)
-                    temporal_diff = (temporal_diff / (3.0 * td_std)).clamp(-1.0, 1.0)
-
-                    inputs = {
-                        "video": video,
-                        "noise": noise,
-                        "temporal_diff": temporal_diff,
-                        "lpd_features": lpd_features,
-                        "l2_distance": torch.norm(clean_embeddings - noisy_embeddings, p=2, dim=1, keepdim=True),
-                        "embedding_diff": clean_embeddings - noisy_embeddings,
-                        "clean_embedding": clean_embeddings,   # DirectFeatureBranch anchor
-                        "per_frame_features": per_frame_cls,
-                        "npr_features": extract_npr_features(video) if hasattr(self, '_use_npr') else None,
-                    }
-
-                    outputs = self.classifier(use_max_for_eval=False, **inputs)
-                    if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
-                        ensemble_logits, branch_logits = outputs
-                    else:
-                        ensemble_logits = outputs
-                        branch_logits = {"ensemble": outputs}
-
-                    labels_squeezed = labels.squeeze(-1) if labels.dim() > 1 else labels
+                    # 7. Classification loss (ensemble mode)
                     classification_loss = torch.tensor(0.0, device=self.device)
-                    num_branches = len(branch_logits)
-                    for logits in branch_logits.values():
-                        classification_loss = classification_loss + self.bce_loss_fn(logits.squeeze(-1), labels_squeezed)
-                    # Normalise by branch count so cls_loss always reflects a single-branch-equivalent BCE.
-                    # Without this, 4 branches produce cls_loss ≈ 4×0.693 = 2.77 at chance,
-                    # which overwhelms embedding_loss and makes the loss signal uninterpretable.
-                    if num_branches > 0:
-                        classification_loss = classification_loss / num_branches
+                    batch_accuracy = 0.0
+                    if labels is not None and self.training_mode == "ensemble":
+                        lpd_features = None
 
-                    cls_logits = ensemble_logits.reshape(-1)
-                    cls_probs = torch.sigmoid(cls_logits)
-                    cls_preds = (cls_probs >= 0.5).float()
-                    labels_flat = labels.reshape(-1)
-                    batch_correct = (cls_preds == labels_flat).sum().item()
-                    batch_accuracy = batch_correct / labels_flat.size(0)
-                    total_correct += batch_correct
-                    total_samples += labels_flat.size(0)
+                        frame_diffs = video[:, 1:] - video[:, :-1]
+                        frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)
+                        temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous()
+                        td_std = temporal_diff.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-4)
+                        temporal_diff = (temporal_diff / (3.0 * td_std)).clamp(-1.0, 1.0)
 
-                # Total Loss & Backprop
-                if self.training_mode == "ensemble":
-                    loss = embedding_loss + self.lambda_classification * classification_loss
-                else:
-                    loss = embedding_loss
+                        inputs = {
+                            "video": video,
+                            "noise": noise,
+                            "temporal_diff": temporal_diff,
+                            "lpd_features": lpd_features,
+                            "l2_distance": torch.norm(
+                                clean_embeddings.float() - noisy_embeddings.float(), p=2, dim=1, keepdim=True
+                            ),
+                            "embedding_diff": clean_embeddings.float() - noisy_embeddings.float(),
+                            "clean_embedding": clean_embeddings,
+                            "per_frame_features": per_frame_cls,
+                            "npr_features": extract_npr_features(video),
+                        }
 
-                self.decoder_optimizer.zero_grad()
+                        outputs = self.classifier(use_max_for_eval=False, **inputs)
+                        if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
+                            ensemble_logits, branch_logits = outputs
+                        else:
+                            ensemble_logits = outputs
+                            branch_logits = {"ensemble": outputs}
+
+                        labels_squeezed = labels.squeeze(-1) if labels.dim() > 1 else labels
+                        classification_loss = torch.tensor(0.0, device=self.device)
+                        num_branches = len(branch_logits)
+                        for logits in branch_logits.values():
+                            classification_loss = classification_loss + self.bce_loss_fn(
+                                logits.squeeze(-1), labels_squeezed
+                            )
+                        if num_branches > 0:
+                            classification_loss = classification_loss / num_branches
+
+                        cls_logits = ensemble_logits.reshape(-1)
+                        cls_probs = torch.sigmoid(cls_logits)
+                        cls_preds = (cls_probs >= 0.5).float()
+                        labels_flat = labels.reshape(-1)
+                        batch_correct = (cls_preds == labels_flat).sum().item()
+                        batch_accuracy = batch_correct / labels_flat.size(0)
+                        total_correct += batch_correct
+                        total_samples += labels_flat.size(0)
+
+                    # 8. Total loss
+                    if self.training_mode == "ensemble":
+                        loss = embedding_loss + self.lambda_classification * classification_loss
+                    else:
+                        loss = embedding_loss
+
+                # ── AMP backward + clipping + step ───────────────────────────
+                self.scaler.scale(loss).backward()
+
+                # Unscale before clipping so we clip the actual gradient magnitudes
+                self.scaler.unscale_(self.decoder_optimizer)
                 if self.classifier_optimizer is not None:
-                    self.classifier_optimizer.zero_grad()
+                    self.scaler.unscale_(self.classifier_optimizer)
 
-                loss.backward()
+                decoder_model = self.decoder.module if self.is_ddp else self.decoder
+                all_params = list(decoder_model.parameters())
+                if self.classifier is not None:
+                    clf_model = self.classifier.module if self.is_ddp else self.classifier
+                    all_params += list(clf_model.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 
-                self.decoder_optimizer.step()
+                self.scaler.step(self.decoder_optimizer)
                 if self.classifier_optimizer is not None:
-                    self.classifier_optimizer.step()
+                    self.scaler.step(self.classifier_optimizer)
+                self.scaler.update()
 
                 total_loss += loss.item()
                 total_emb_loss += embedding_loss.item()
@@ -2022,9 +2105,9 @@ class EmbeddingTrainer:
                         pbar_dict['acc'] = f'{batch_accuracy:.4f}'
                     pbar.set_postfix(pbar_dict)
 
-                # Print periodic progress to stdout/log file (especially important for non-TTY/Jenkins logging)
                 if self.rank == 0 and batch_idx % 50 == 0:
-                    log_str = f"Epoch {epoch} | Batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f}"
+                    pct = (batch_idx / max(total_batches, 1)) * 100
+                    log_str = f"Epoch {epoch} [{batch_idx}/{total_batches} ({pct:.1f}%)] | Loss: {loss.item():.4f}"
                     if labels is not None and (labels == 0).any() and (labels == 1).any():
                         log_str += f" | sim_r: {self._last_real_similarity:.4f} | sim_f: {self._last_fake_similarity:.4f}"
                     if self.training_mode == "ensemble" and labels is not None:
@@ -2361,6 +2444,14 @@ class EmbeddingTrainer:
                 print(f"  Batch accuracy: {batch_accuracy:.4f}")
                 print(f"  Noise range: [{noise.min():.6f}, {noise.max():.6f}], std: {noise.std():.6f}")
 
+            # ── Gradient clipping (image mode) ───────────────────────────
+            decoder_model_img = self.decoder.module if self.is_ddp else self.decoder
+            img_params = list(decoder_model_img.parameters())
+            if self.classifier is not None:
+                clf_model_img = self.classifier.module if self.is_ddp else self.classifier
+                img_params += list(clf_model_img.parameters())
+            torch.nn.utils.clip_grad_norm_(img_params, max_norm=1.0)
+
             # Step both optimizers
             self.decoder_optimizer.step()
             if self.classifier_optimizer is not None:
@@ -2406,12 +2497,13 @@ class EmbeddingTrainer:
 
         # Aggregate metrics
         metrics = {
-            'loss': total_loss / num_batches,
-            'embedding_loss': total_emb_loss / num_batches,
-            'disc_r_minus_f': total_similarity / num_batches,  # Real discrepancy - Fake discrepancy
+            'loss': total_loss / max(num_batches, 1),
+            'embedding_loss': total_emb_loss / max(num_batches, 1),
+            # total_similarity is now a proper accumulation, not last-batch overwrite
+            'similarity': total_similarity / max(num_batches, 1),
         }
         if self.training_mode in ["with_classification", "noise_embedding_classifier", "noise_embedding_joint", "ensemble", "ablation"]:
-            metrics['classification_loss'] = total_cls_loss / num_batches
+            metrics['classification_loss'] = total_cls_loss / max(num_batches, 1)
             if total_samples > 0:
                 metrics['accuracy'] = total_correct / total_samples
 
@@ -2420,6 +2512,12 @@ class EmbeddingTrainer:
                 metric_tensor = torch.tensor(metrics[key], device=self.device)
                 dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
                 metrics[key] = (metric_tensor / self.world_size).item()
+
+        # Step LR schedulers at end of every epoch
+        if self.decoder_scheduler is not None:
+            self.decoder_scheduler.step()
+        if self.classifier_scheduler is not None:
+            self.classifier_scheduler.step()
 
         return metrics
 

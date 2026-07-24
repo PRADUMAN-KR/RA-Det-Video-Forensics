@@ -206,14 +206,16 @@ class LearnedWeightFusion(FusionStrategy, nn.Module):
         if num_branches != self.num_branches:
             self._resize_weights(num_branches)
 
-        # Stack logits: [B, 1, N]
+        # Stack branch logits: [B, 1, N] (each branch returns [B, 1])
         stacked = torch.stack(list(logits_dict.values()), dim=-1)
 
-        # Get softmax-normalized weights
-        normalized_weights = F.softmax(self.weights[:num_branches], dim=0)  # [N]
+        # Softmax-normalized weights: [N]
+        normalized_weights = F.softmax(self.weights[:num_branches], dim=0)
 
-        # Apply weights
-        return (stacked * normalized_weights.view(1, -1, 1)).sum(dim=-1, keepdim=True)
+        # Weighted sum over branch dim.
+        # [B, 1, N] * [N] broadcasts correctly → [B, 1, N] → sum → [B, 1]
+        # BUG WAS: .view(1, -1, 1) → [1, N, 1] which broadcast [B,1,N]*[1,N,1] → [B,N,N]
+        return (stacked * normalized_weights).sum(dim=-1)  # [B, 1]
 
     def _resize_weights(self, new_size: int):
         """Resize weight parameter when branch count changes."""

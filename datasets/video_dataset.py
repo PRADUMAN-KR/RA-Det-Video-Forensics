@@ -100,15 +100,30 @@ class VideoDataset(Dataset):
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
             # Check if this directory represents a real or fake folder
             label = None
-            path_parts_lower = [p.lower() for p in Path(dirpath).parts]
+            try:
+                rel_path = os.path.relpath(dirpath, self.root_dir)
+                path_parts_lower = [p.lower() for p in Path(rel_path).parts]
+            except Exception:
+                path_parts_lower = [p.lower() for p in Path(dirpath).parts]
+
+            # Also check basename of root_dir if scanning directly inside real/ or fake/
+            all_parts = path_parts_lower + [os.path.basename(self.root_dir).lower()]
             
-            for part in path_parts_lower:
-                if any(k in part for k in ["0_real", "real", "kinetics"]):
+            for part in all_parts:
+                if any(k == part or part.startswith(k + "_") or part.endswith("_" + k) or ("/" + k + "/") in part for k in ["0_real", "real", "kinetics"]) or part in ["0_real", "real", "kinetics"]:
                     label = 0
                     break
-                elif any(k in part for k in ["1_fake", "fake", "genbuster", "synthetic", "aigc"]):
+                elif any(k == part or part.startswith(k + "_") or part.endswith("_" + k) or ("/" + k + "/") in part for k in ["1_fake", "fake", "genbuster", "synthetic", "aigc"]) or part in ["1_fake", "fake", "genbuster", "synthetic", "aigc"]:
                     label = 1
                     break
+            
+            # Direct string fallback check
+            if label is None:
+                rel_lower = rel_path.lower()
+                if "real" in rel_lower or "0_real" in rel_lower:
+                    label = 0
+                elif "fake" in rel_lower or "1_fake" in rel_lower:
+                    label = 1
 
             # Extract generator type from path parts if available
             generator = "unknown"

@@ -201,6 +201,25 @@ class CrossAttentionBottleneck3D(nn.Module):
     def forward(self, image_feat, clean_embed_feat, noisy_embed_feat):
         B, C, T, H, W = image_feat.shape
 
+        # Align embedding feature maps to image_feat's spatiotemporal size.
+        # EmbeddingEncoder3D may use a different bottleneck_size (e.g. 7) than
+        # the UNet bottleneck spatial size (e.g. 14 after 4× downsampling of 224px).
+        # Trilinear interpolation is cheap (no learnable params) and keeps the
+        # cross-attention semantically correct regardless of bottleneck_size config.
+        def _align(feat, target_t, target_h, target_w):
+            _, _, ft, fh, fw = feat.shape
+            if ft == target_t and fh == target_h and fw == target_w:
+                return feat  # already the right size — skip interpolation
+            return F.interpolate(
+                feat.float(),
+                size=(target_t, target_h, target_w),
+                mode="trilinear",
+                align_corners=False,
+            ).to(feat.dtype)
+
+        clean_embed_feat = _align(clean_embed_feat, T, H, W)
+        noisy_embed_feat = _align(noisy_embed_feat, T, H, W)
+
         # Flatten spatiotemporal dimensions: [B, T*H*W, C]
         image_flat = image_feat.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
         clean_flat = clean_embed_feat.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
@@ -333,7 +352,8 @@ class UNetDecoder3D(nn.Module):
         num_heads=8,
         use_attention=True,
         eps=16/255,
-        bottleneck_size=7
+        bottleneck_size=7,
+        **kwargs
     ):
         super().__init__()
 
@@ -434,15 +454,21 @@ class UNetDecoder3D(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, original_video, clean_embedding, multi_scale_videos=None):
+    def forward(self, original_video, clean_embedding, multi_scale_videos=None, noisy_embedding=None):
         """
         Args:
-            original_video: [B, 3, T, H, W]
-            clean_embedding: [B, embed_dim]
-            multi_scale_videos: [B, strategy_channels, T, H, W] or None
-            
+            original_video:    [B, 3, T, H, W]
+            clean_embedding:   [B, embed_dim]  — embedding of the unperturbed video
+            multi_scale_videos:[B, strategy_channels, T, H, W] or None
+            noisy_embedding:   [B, embed_dim] or None — embedding of the perturbed video.
+                               When provided, the cross-attention bottleneck contrasts clean
+                               vs. noisy features to refine the perturbation. When None
+                               (e.g. the very first decoder call before noise exists),
+                               clean_embedding is used for both arms — the bottleneck then
+                               acts as a pure self-attention over the clean feature.
+
         Returns:
-            noise: [B, 3, T, H, W] Bounded spatiotemporal perturbation
+            noise: [B, 3, T, H, W] — bounded spatiotemporal perturbation
         """
         num_frames = original_video.shape[2]
 
@@ -457,8 +483,11 @@ class UNetDecoder3D(nn.Module):
                 encoder_skips.append(x)
 
         # 3. Embedding Projection & Tiling
+        # Use noisy_embedding for the second arm when available; fall back to
+        # clean_embedding so the bottleneck still gets valid input on the first pass.
+        reference_noisy = noisy_embedding if noisy_embedding is not None else clean_embedding
         clean_embed_feat = self.clean_embedding_encoder(clean_embedding, num_frames)
-        noisy_embed_feat = self.noisy_embedding_encoder(clean_embedding, num_frames)
+        noisy_embed_feat = self.noisy_embedding_encoder(reference_noisy, num_frames)
 
         # 4. Spatiotemporal Bottleneck fusion
         x = self.bottleneck(x, clean_embed_feat, noisy_embed_feat)

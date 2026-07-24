@@ -399,6 +399,7 @@ def validate_only(config, checkpoint_path):
         use_four_branch_ensemble=config.get('use_four_branch_ensemble', False),
         noise_embedding_use_l2=config.get('noise_embedding_use_l2', False),
         embedding_loss_weight=config.get('embedding_loss_weight', 1.0),
+        use_amp=config.get('use_amp', True),
     )
 
     # Setup training mode (SAME AS train())
@@ -544,18 +545,19 @@ def train(config):
         decoder_kwargs=decoder_kwargs,
         strategy=strategy,
         use_multi_scale_decoder=use_multi_scale_decoder,
-        lpd_strategy=lpd_strategy,  # Add LPD strategy for ensemble
-        loss_type=config.get('loss_type', 'similarity'),  # 'similarity' or 'discrepancy'
-        margin=config.get('margin', 0.1),  # Margin for discrepancy loss
-        fusion_method=config.get('fusion_method', 'logit_weighted'),  # Ensemble fusion method
-        eps_randomization=config.get('eps_randomization', False),  # Epsilon randomization for domain generalization
-        eps_min=config.get('eps_min', config['attack_eps']),  # Min epsilon for randomization
-        eps_max=config.get('eps_max', config['attack_eps']),  # Max epsilon for randomization
-        eps_schedule=config.get('eps_schedule', 'random'),  # Epsilon schedule
-        normalize_loss=config.get('normalize_loss', False),  # Loss normalization for domain generalization
-        use_four_branch_ensemble=config.get('use_four_branch_ensemble', False),  # Use 4-branch ensemble
-        noise_embedding_use_l2=config.get('noise_embedding_use_l2', False),  # Add L2 branch to noise_embedding classifier
-        embedding_loss_weight=config.get('embedding_loss_weight', 1.0),  # Weight for embedding loss
+        lpd_strategy=lpd_strategy,
+        loss_type=config.get('loss_type', 'similarity'),
+        margin=config.get('margin', 0.1),
+        fusion_method=config.get('fusion_method', 'logit_weighted'),
+        eps_randomization=config.get('eps_randomization', False),
+        eps_min=config.get('eps_min', config['attack_eps']),
+        eps_max=config.get('eps_max', config['attack_eps']),
+        eps_schedule=config.get('eps_schedule', 'random'),
+        normalize_loss=config.get('normalize_loss', False),
+        use_four_branch_ensemble=config.get('use_four_branch_ensemble', False),
+        noise_embedding_use_l2=config.get('noise_embedding_use_l2', False),
+        embedding_loss_weight=config.get('embedding_loss_weight', 1.0),
+        use_amp=config.get('use_amp', True),
     )
 
     # Setup training mode
@@ -578,6 +580,9 @@ def train(config):
     save_every = config.get('save_every', 1)
     patience = config.get('patience', 10)
     patience_counter = 0
+
+    # Setup CosineAnnealingLR now that niter is known
+    trainer.setup_schedulers(niter)
 
     if rank == 0:
         print(f"\nStarting training for {niter} epochs...")
@@ -865,6 +870,12 @@ def main():
         default=None,
         help='Number of DataLoader worker processes. Use 0 for restricted environments like Jenkins (default: 4)'
     )
+    parser.add_argument(
+        '--no-amp',
+        action='store_true',
+        help='Disable mixed-precision (BF16/FP16) AMP and train in full FP32. '
+             'Uses ~2x more VRAM but may help debug numerical issues.'
+    )
 
     args = parser.parse_args()
 
@@ -935,6 +946,9 @@ def main():
         config['batch_size'] = args.batch_size
     if args.num_workers is not None:
         config['num_workers'] = args.num_workers
+
+    # AMP setting (default on; --no-amp forces FP32)
+    config['use_amp'] = not args.no_amp
 
     # Override with resume checkpoint if provided
     if args.resume:
