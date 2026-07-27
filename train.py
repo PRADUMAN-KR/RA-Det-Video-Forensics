@@ -570,9 +570,11 @@ def train(config):
     start_epoch = 1
     best_val_similarity = float('inf')  # Lower is better (we want to minimize similarity)
     best_val_score = 0.0               # Higher is better (for AUC metric in ensemble mode)
+    resumed_epoch = None               # Track which epoch we resumed from (needs catch-up validation)
     if config.get('resume_checkpoint'):
         trainer.load_checkpoint(config['resume_checkpoint'])
-        start_epoch = trainer.current_epoch + 1
+        resumed_epoch = trainer.current_epoch   # e.g. 1
+        start_epoch = resumed_epoch + 1         # e.g. 2
         best_val_similarity = getattr(trainer, 'best_val_similarity', float('inf'))
 
     # Training loop
@@ -592,6 +594,43 @@ def train(config):
     train_metrics = {}
     val_metrics = {}
 
+    # ── Catch-up validation for resumed epoch ────────────────────────────────
+    # When resuming from epoch N, training for epoch N is already done but
+    # validation never ran (the crash happened there). Run it now so that
+    # best-checkpoint selection and early-stopping counters start correctly.
+    if resumed_epoch is not None:
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print(f"Catch-up validation for resumed epoch {resumed_epoch}/{niter}")
+            print(f"{'='*60}")
+
+        val_metrics = trainer.validate(val_loader, resumed_epoch)
+
+        if rank == 0:
+            print(f"\nValidation metrics (epoch {resumed_epoch}):")
+            for key, value in val_metrics.items():
+                print(f"  {key}: {value:.4f}")
+
+            use_auc = 'val/auc' in val_metrics and config.get('training_mode') == 'ensemble'
+            if use_auc:
+                current_score = val_metrics['val/auc']
+                is_best = current_score > best_val_score
+                metric_name = "AUC"
+            else:
+                current_score = val_metrics.get('val/similarity', float('inf'))
+                is_best = current_score < best_val_similarity
+                metric_name = "similarity"
+
+            if is_best:
+                if use_auc:
+                    best_val_score = current_score
+                else:
+                    best_val_similarity = current_score
+                    trainer.best_val_similarity = best_val_similarity
+                trainer.save_checkpoint(resumed_epoch, filename="checkpoint_best.pt")
+                print(f"  ★ New best model saved! ({metric_name}: {current_score:.4f})")
+    # ─────────────────────────────────────────────────────────────────────────
+
     for epoch in range(start_epoch, niter + 1):
         if rank == 0:
             print(f"\n{'='*60}")
@@ -610,6 +649,10 @@ def train(config):
             for key, value in train_metrics.items():
                 print(f"  {key}: {value:.4f}")
 
+        # Save epoch checkpoint BEFORE validation so a validation crash never loses a trained epoch
+        if epoch % save_every == 0:
+            trainer.save_checkpoint(epoch)
+
         # Validate
         val_metrics = trainer.validate(val_loader, epoch)
 
@@ -617,10 +660,6 @@ def train(config):
             print(f"\nValidation metrics:")
             for key, value in val_metrics.items():
                 print(f"  {key}: {value:.4f}")
-
-        # Save checkpoint
-        if epoch % save_every == 0:
-            trainer.save_checkpoint(epoch)
 
         # Save best model and check early stopping
         if rank == 0:

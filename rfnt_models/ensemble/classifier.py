@@ -177,10 +177,14 @@ class FlexibleEnsembleClassifier(nn.Module):
                 "No branches registered. Use register_branch() to add branches."
             )
 
-        # Handle use_max_for_eval by temporarily switching fusion
-        original_fusion = self.fusion_strategy
+        # Select fusion strategy without mutating self.fusion_strategy.
+        # Mutating self.fusion_strategy is illegal when it holds an nn.Module submodule
+        # (e.g. LearnedWeightFusion) because PyTorch's __setattr__ rejects assigning a
+        # non-Module (e.g. MaxFusion, which is not nn.Module) to a registered module slot.
         if use_max_for_eval and not isinstance(self.fusion_strategy, MaxFusion):
-            self.fusion_strategy = MaxFusion()
+            active_fusion = MaxFusion()
+        else:
+            active_fusion = self.fusion_strategy
 
         # Collect logits from all branches
         branch_logits = {}
@@ -193,12 +197,8 @@ class FlexibleEnsembleClassifier(nn.Module):
                     f"Ensure all required inputs are provided: {branch.get_input_keys()}"
                 )
 
-        # Fuse using the configured strategy
-        ensemble_logits = self.fusion_strategy.forward(branch_logits)
-
-        # Restore original fusion
-        if use_max_for_eval and not isinstance(original_fusion, MaxFusion):
-            self.fusion_strategy = original_fusion
+        # Fuse using the selected strategy
+        ensemble_logits = active_fusion.forward(branch_logits)
 
         if return_all_logits:
             return ensemble_logits, branch_logits

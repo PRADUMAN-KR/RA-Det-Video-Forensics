@@ -667,8 +667,8 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     temporal_diff = temporal_diff / td_max
 
                     # Compute per-frame features and NPR features for video branches
-                    if hasattr(self.encoder, "encode_video_detailed"):
-                        _, per_frame_cls_eval, _ = self.encoder.encode_video_detailed(video)
+                    if hasattr(encoder, "encode_video_detailed"):
+                        _, per_frame_cls_eval, _ = encoder.encode_video_detailed(video)
                     else:
                         per_frame_cls_eval = None
 
@@ -885,45 +885,51 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
             all_l2_probs = self.all_gather_tensor(l2_probs_tensor, self.world_size, self.rank) if l2_probs_tensor is not None else None
             all_diff_probs = self.all_gather_tensor(diff_probs_tensor, self.world_size, self.rank) if diff_probs_tensor is not None else None
 
-            # Convert to numpy on CPU
-            all_similarities = all_similarities.cpu().numpy()
-            all_l2 = all_l2.cpu().numpy()
-            all_labels = all_labels.cpu().numpy()
-            all_probs = all_probs.cpu().numpy()
-            all_gen_indices = all_gen_indices_tensor.cpu().numpy()
-            all_foundation_probs = all_foundation_probs.cpu().numpy() if all_foundation_probs is not None else None
-            all_scratch_probs = all_scratch_probs.cpu().numpy() if all_scratch_probs is not None else None
-            all_l2_probs = all_l2_probs.cpu().numpy() if all_l2_probs is not None else None
-            all_diff_probs = all_diff_probs.cpu().numpy() if all_diff_probs is not None else None
+            # Convert to numpy on CPU and flatten to 1D
+            all_similarities = np.asarray(all_similarities.cpu().numpy()).reshape(-1)
+            all_l2 = np.asarray(all_l2.cpu().numpy()).reshape(-1)
+            all_labels = np.asarray(all_labels.cpu().numpy()).reshape(-1)
+            all_probs = np.asarray(all_probs.cpu().numpy()).reshape(-1)
+            all_gen_indices = np.asarray(all_gen_indices_tensor.cpu().numpy()).reshape(-1)
+            all_foundation_probs = np.asarray(all_foundation_probs.cpu().numpy()).reshape(-1) if all_foundation_probs is not None else None
+            all_scratch_probs = np.asarray(all_scratch_probs.cpu().numpy()).reshape(-1) if all_scratch_probs is not None else None
+            all_l2_probs = np.asarray(all_l2_probs.cpu().numpy()).reshape(-1) if all_l2_probs is not None else None
+            all_diff_probs = np.asarray(all_diff_probs.cpu().numpy()).reshape(-1) if all_diff_probs is not None else None
             all_generators = [idx_to_gen[idx] for idx in all_gen_indices]
         else:
-            all_similarities = np.array(local_similarities)
-            all_l2 = np.array(local_l2_distances)
-            all_labels = np.array(local_labels)
-            all_probs = np.array(local_probs)
-            all_foundation_probs = np.array(local_foundation_probs) if local_foundation_probs else None
-            all_scratch_probs = np.array(local_scratch_probs) if local_scratch_probs else None
-            all_l2_probs = np.array(local_l2_probs) if local_l2_probs else None
-            all_diff_probs = np.array(local_diff_probs) if local_diff_probs else None
+            all_similarities = np.asarray(local_similarities).reshape(-1)
+            all_l2 = np.asarray(local_l2_distances).reshape(-1)
+            all_labels = np.asarray(local_labels).reshape(-1)
+            all_probs = np.asarray(local_probs).reshape(-1)
+            all_foundation_probs = np.asarray(local_foundation_probs).reshape(-1) if local_foundation_probs else None
+            all_scratch_probs = np.asarray(local_scratch_probs).reshape(-1) if local_scratch_probs else None
+            all_l2_probs = np.asarray(local_l2_probs).reshape(-1) if local_l2_probs else None
+            all_diff_probs = np.asarray(local_diff_probs).reshape(-1) if local_diff_probs else None
             all_generators = [idx_to_gen[idx] for idx in local_gen_indices]
 
         # Compute metrics (only on rank 0)
         generator_metrics = {}
         if self.rank == 0:
-            unique_generators = list(set(all_generators))
+            real_indices = np.where(all_labels == 0)[0]
+            fake_generators = sorted(list(set([all_generators[i] for i in range(len(all_generators)) if all_labels[i] == 1])))
 
-            for generator in unique_generators:
-                indices = [i for i, g in enumerate(all_generators) if g == generator]
-                gen_sims = all_similarities[indices]
-                gen_labels = all_labels[indices]
-                gen_l2 = all_l2[indices]
-                gen_probs = all_probs[indices]
+            generators_to_eval = {}
+            if len(fake_generators) > 0 and len(real_indices) > 0:
+                generators_to_eval['overall'] = np.arange(len(all_labels))
+                for gen in fake_generators:
+                    gen_fake_indices = np.where((all_labels == 1) & (np.array(all_generators) == gen))[0]
+                    if len(gen_fake_indices) > 0:
+                        generators_to_eval[gen] = np.concatenate([real_indices, gen_fake_indices])
+            else:
+                unique_generators = list(set(all_generators))
+                for gen in unique_generators:
+                    generators_to_eval[gen] = np.where(np.array(all_generators) == gen)[0]
 
-                # Get individual branch probabilities if available
-                gen_foundation_probs = all_foundation_probs[indices] if all_foundation_probs is not None else None
-                gen_scratch_probs = all_scratch_probs[indices] if all_scratch_probs is not None else None
-                gen_l2_probs = all_l2_probs[indices] if all_l2_probs is not None else None
-                gen_diff_probs = all_diff_probs[indices] if all_diff_probs is not None else None
+            for generator, indices in generators_to_eval.items():
+                gen_sims = all_similarities[indices].reshape(-1)
+                gen_labels = all_labels[indices].reshape(-1)
+                gen_l2 = all_l2[indices].reshape(-1)
+                gen_probs = all_probs[indices].reshape(-1)
 
                 # Separate by real/fake
                 real_mask = gen_labels == 0
@@ -935,7 +941,7 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     ap = average_precision_score(gen_labels, gen_probs)
 
                     # Standard threshold (0.5) metrics & Confusion Matrix
-                    pred_labels_05 = [int(prob >= 0.5) for prob in gen_probs]
+                    pred_labels_05 = (gen_probs >= 0.5).astype(int)
                     prec_05 = precision_score(gen_labels, pred_labels_05, zero_division=0)
                     rec_05 = recall_score(gen_labels, pred_labels_05, zero_division=0)
                     f1_05 = f1_score(gen_labels, pred_labels_05, zero_division=0)
@@ -949,14 +955,14 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     fpr_curve, tpr_curve, thresholds = roc_curve(gen_labels, gen_probs)
                     accuracies = []
                     for threshold in thresholds:
-                        predictions = [(prob >= threshold) for prob in gen_probs]
+                        predictions = (gen_probs >= threshold).astype(int)
                         acc = accuracy_score(gen_labels, predictions)
                         accuracies.append(acc)
 
-                    if accuracies:
+                    if len(accuracies) > 0:
                         optimal_acc = max(accuracies)
                         optimal_threshold = thresholds[accuracies.index(optimal_acc)]
-                        opt_preds = [(prob >= optimal_threshold) for prob in gen_probs]
+                        opt_preds = (gen_probs >= optimal_threshold).astype(int)
                         optimal_prec = precision_score(gen_labels, opt_preds, zero_division=0)
                         optimal_rec = recall_score(gen_labels, opt_preds, zero_division=0)
                     else:
@@ -964,7 +970,8 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                         optimal_threshold = 0.5
                         optimal_prec = 0.0
                         optimal_rec = 0.0
-                except:
+                except Exception as e:
+                    print(f"  [Eval Warning] Metric calculation failed for '{generator}': {e}")
                     auc = 0.0
                     ap = 0.0
                     prec_05 = 0.0
@@ -2105,7 +2112,7 @@ class EmbeddingTrainer:
                         pbar_dict['acc'] = f'{batch_accuracy:.4f}'
                     pbar.set_postfix(pbar_dict)
 
-                if self.rank == 0 and batch_idx % 50 == 0:
+                if self.rank == 0 and batch_idx % 100 == 0:
                     pct = (batch_idx / max(total_batches, 1)) * 100
                     log_str = f"Epoch {epoch} [{batch_idx}/{total_batches} ({pct:.1f}%)] | Loss: {loss.item():.4f}"
                     if labels is not None and (labels == 0).any() and (labels == 1).any():
@@ -2493,6 +2500,15 @@ class EmbeddingTrainer:
                     pbar_dict['acc'] = f'{batch_accuracy:.4f}'
                 pbar.set_postfix(pbar_dict)
 
+            if self.rank == 0 and batch_idx % 100 == 0:
+                pct = (batch_idx / max(total_batches, 1)) * 100
+                log_str = f"Epoch {epoch} [{batch_idx}/{total_batches} ({pct:.1f}%)] | Loss: {loss.item():.4f}"
+                if labels is not None and (labels == 0).any() and (labels == 1).any():
+                    log_str += f" | sim_r: {self._last_real_similarity:.4f} | sim_f: {self._last_fake_similarity:.4f}"
+                if self.training_mode in ["with_classification", "noise_embedding_classifier", "noise_embedding_joint", "ensemble", "ablation"] and labels is not None:
+                    log_str += f" | cls_loss: {classification_loss.item():.4f} | acc: {batch_accuracy:.4f}"
+                print(log_str, flush=True)
+
             self.global_step += 1
 
         # Aggregate metrics
@@ -2544,31 +2560,37 @@ class EmbeddingTrainer:
         # Aggregate metrics across all generators
         metrics = {}
         if generator_metrics:
-            # Average across all generators
-            all_similarities = [m['mean_similarity'] for m in generator_metrics.values()]
-            all_l2_distances = [m['mean_l2_distance'] for m in generator_metrics.values()]
-            all_aucs = [m['auc'] for m in generator_metrics.values()]
-            all_aps = [m['average_precision'] for m in generator_metrics.values()]
-            all_precs = [m['precision'] for m in generator_metrics.values() if 'precision' in m]
-            all_recs = [m['recall'] for m in generator_metrics.values() if 'recall' in m]
-            all_f1s = [m['f1_score'] for m in generator_metrics.values() if 'f1_score' in m]
-            all_opt_accs = [m['optimal_accuracy'] for m in generator_metrics.values()]
+            # Separate overall metrics from per-generator metrics
+            overall_m = generator_metrics.get('overall', None)
+            gen_metrics_dict = {k: v for k, v in generator_metrics.items() if k != 'overall'}
+            if not gen_metrics_dict:
+                gen_metrics_dict = generator_metrics
+
+            # Average across individual generators
+            all_similarities = [m['mean_similarity'] for m in gen_metrics_dict.values()]
+            all_l2_distances = [m['mean_l2_distance'] for m in gen_metrics_dict.values()]
+            all_aucs = [m['auc'] for m in gen_metrics_dict.values()]
+            all_aps = [m['average_precision'] for m in gen_metrics_dict.values()]
+            all_precs = [m['precision'] for m in gen_metrics_dict.values() if 'precision' in m]
+            all_recs = [m['recall'] for m in gen_metrics_dict.values() if 'recall' in m]
+            all_f1s = [m['f1_score'] for m in gen_metrics_dict.values() if 'f1_score' in m]
+            all_opt_accs = [m['optimal_accuracy'] for m in gen_metrics_dict.values()]
 
             metrics['val/similarity'] = sum(all_similarities) / len(all_similarities)
             metrics['val/l2_distance'] = sum(all_l2_distances) / len(all_l2_distances)
-            metrics['val/auc'] = sum(all_aucs) / len(all_aucs)
-            metrics['val/average_precision'] = sum(all_aps) / len(all_aps)
+            metrics['val/auc'] = overall_m['auc'] if overall_m else (sum(all_aucs) / len(all_aucs))
+            metrics['val/average_precision'] = overall_m['average_precision'] if overall_m else (sum(all_aps) / len(all_aps))
             if all_precs:
-                metrics['val/precision'] = sum(all_precs) / len(all_precs)
-                metrics['val/recall'] = sum(all_recs) / len(all_recs)
-                metrics['val/f1_score'] = sum(all_f1s) / len(all_f1s)
-            metrics['val/optimal_accuracy'] = sum(all_opt_accs) / len(all_opt_accs)
+                metrics['val/precision'] = overall_m['precision'] if overall_m else (sum(all_precs) / len(all_precs))
+                metrics['val/recall'] = overall_m['recall'] if overall_m else (sum(all_recs) / len(all_recs))
+                metrics['val/f1_score'] = overall_m['f1_score'] if overall_m else (sum(all_f1s) / len(all_f1s))
+            metrics['val/optimal_accuracy'] = overall_m['optimal_accuracy'] if overall_m else (sum(all_opt_accs) / len(all_opt_accs))
 
             # Aggregate real/fake similarities if available
-            real_sims = [m['similarity_real'] for m in generator_metrics.values() if 'similarity_real' in m]
-            fake_sims = [m['similarity_fake'] for m in generator_metrics.values() if 'similarity_fake' in m]
-            real_l2s = [m['l2_distance_real'] for m in generator_metrics.values() if 'l2_distance_real' in m]
-            fake_l2s = [m['l2_distance_fake'] for m in generator_metrics.values() if 'l2_distance_fake' in m]
+            real_sims = [m['similarity_real'] for m in gen_metrics_dict.values() if 'similarity_real' in m]
+            fake_sims = [m['similarity_fake'] for m in gen_metrics_dict.values() if 'similarity_fake' in m]
+            real_l2s = [m['l2_distance_real'] for m in gen_metrics_dict.values() if 'l2_distance_real' in m]
+            fake_l2s = [m['l2_distance_fake'] for m in gen_metrics_dict.values() if 'l2_distance_fake' in m]
 
             if real_sims:
                 metrics['val/similarity_real'] = sum(real_sims) / len(real_sims)
@@ -2577,11 +2599,18 @@ class EmbeddingTrainer:
                 metrics['val/similarity_fake'] = sum(fake_sims) / len(fake_sims)
                 metrics['val/l2_distance_fake'] = sum(fake_l2s) / len(fake_l2s)
 
-            # Aggregate confusion matrix totals
-            total_tn = sum(m.get('tn', 0) for m in generator_metrics.values())
-            total_fp = sum(m.get('fp', 0) for m in generator_metrics.values())
-            total_fn = sum(m.get('fn', 0) for m in generator_metrics.values())
-            total_tp = sum(m.get('tp', 0) for m in generator_metrics.values())
+            # Confusion matrix totals (use overall_m if present to avoid double counting reals)
+            if overall_m:
+                total_tn = overall_m.get('tn', 0)
+                total_fp = overall_m.get('fp', 0)
+                total_fn = overall_m.get('fn', 0)
+                total_tp = overall_m.get('tp', 0)
+            else:
+                total_tn = sum(m.get('tn', 0) for m in gen_metrics_dict.values())
+                total_fp = sum(m.get('fp', 0) for m in gen_metrics_dict.values())
+                total_fn = sum(m.get('fn', 0) for m in gen_metrics_dict.values())
+                total_tp = sum(m.get('tp', 0) for m in gen_metrics_dict.values())
+
             total_samples = total_tn + total_fp + total_fn + total_tp
 
             metrics['val/tn'] = total_tn
