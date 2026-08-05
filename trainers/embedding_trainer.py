@@ -978,16 +978,68 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
                     fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
 
-                    # Calculate optimal threshold using Youden's J statistic: max(TPR - FPR).
-                    # This is numerically stable and avoids the float32 saturation bug where
-                    # sigmoid outputs saturate to exactly 1.0, causing sklearn's roc_curve to
-                    # prepend an artificial threshold of 1.0+ε that gets incorrectly selected
-                    # as "optimal" by the old accuracy-loop approach.
-                    fpr_curve, tpr_curve, thresholds = roc_curve(gen_labels, gen_probs)
-                    j_scores = tpr_curve - fpr_curve   # Youden's J for each threshold
-                    best_idx = int(np.argmax(j_scores))
+                    # Threshold selection: robust margin search, NOT raw Youden's J argmax.
+                    #
+                    # Pure Youden's J (max TPR-FPR) finds the threshold with the fewest total
+                    # misclassifications on THIS validation set. When class separation is
+                    # near-perfect, that optimum is often a threshold squeezed into a very
+                    # THIN gap next to one edge of a cluster (e.g. one hard-to-detect fake
+                    # sample sitting just above the real cluster, with nothing between them).
+                    # Mathematically that IS the fewest errors on this data — but it gives
+                    # near-zero margin against small distribution shift in production (a real
+                    # video that scores even slightly higher than usual becomes a false
+                    # positive). A threshold that costs one extra misclassification here but
+                    # sits in a much WIDER stable region is a better production choice.
+                    #
+                    # drop_intermediate=False: preserve every unique observed probability as
+                    # its own threshold point so gap widths reflect the true data, not an
+                    # approximation pruned by sklearn's default ROC-curve simplification.
+                    fpr_curve, tpr_curve, thresholds = roc_curve(gen_labels, gen_probs, drop_intermediate=False)
+
+                    n_neg = int(real_mask.sum())
+                    n_pos = int(fake_mask.sum())
+                    # Reconstruct actual error counts (not just rates) at every threshold.
+                    fp_counts = fpr_curve * n_neg
+                    fn_counts = (1.0 - tpr_curve) * n_pos
+                    total_errors = fp_counts + fn_counts
+                    min_errors = float(total_errors.min())
+
+                    # Allow up to 1 extra misclassification (vs. the mathematical minimum) in
+                    # exchange for a wider, more robust threshold region. This is a deliberate
+                    # accuracy-for-robustness tradeoff, not a numerical correction — it directly
+                    # matches picking a threshold from a wide, stable plateau in a sweep table
+                    # over a knife-edge point that happens to score marginally higher on this
+                    # specific validation set.
+                    error_tolerance = 1.0
+                    candidate_idx = np.where(total_errors <= (min_errors + error_tolerance + 1e-6))[0]
+
+                    best_gap = -1.0
+                    best_lo, best_hi = None, None
+                    for idx in candidate_idx:
+                        hi = float(thresholds[idx])
+                        if not np.isfinite(hi):
+                            continue
+                        lo = float(thresholds[idx + 1]) if idx + 1 < len(thresholds) else 0.0
+                        if not np.isfinite(lo):
+                            lo = 0.0
+                        gap = hi - lo
+                        if gap > best_gap:
+                            best_gap = gap
+                            best_lo, best_hi = lo, hi
+
+                    if best_hi is not None:
+                        raw_threshold = (best_hi + best_lo) / 2.0
+                    else:
+                        # Fallback: pure Youden's J argmax, centered in its immediate gap.
+                        j_scores = tpr_curve - fpr_curve
+                        best_idx = int(np.argmax(j_scores))
+                        best_threshold = float(thresholds[best_idx])
+                        next_lower = float(thresholds[best_idx + 1]) if best_idx + 1 < len(thresholds) else 0.0
+                        if not np.isfinite(next_lower):
+                            next_lower = 0.0
+                        raw_threshold = (best_threshold + next_lower) / 2.0
+
                     # Clamp to (0, 1) open interval — sigmoid can never equal 0.0 or 1.0 exactly
-                    raw_threshold = float(thresholds[best_idx])
                     optimal_threshold = float(np.clip(raw_threshold, 0.01, 0.99))
 
                     # Compute accuracy and precision/recall at this optimal threshold

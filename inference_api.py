@@ -1,8 +1,9 @@
 """
 RA-Det FastAPI Inference Pipeline — Temporal Video Deepfake Detection.
 
-Loads the trained epoch-5 NPR ensemble checkpoint
-(VideoMAE encoder + UNetDecoder3D + VideoEnsembleClassifier)
+Loads the trained dinov2_temporal_v1 NPR ensemble checkpoint (epoch 18/20,
+re-validated with corrected scoring — see VAL_SIM_REAL etc. below)
+(DINOv2 video encoder + UNetDecoder3D + VideoEnsembleClassifier)
 and exposes a REST API for real/fake video classification.
 
 Usage:
@@ -147,14 +148,16 @@ UNFREEZE_LAST_N_BLOCKS = int(_decoder_cfg.get("unfreeze_last_n_blocks", 0))
 TEMPORAL_TRANSFORMER_LAYERS = int(_decoder_cfg.get("temporal_transformer_layers", 2))
 
 # ---------------------------------------------------------------------------
-# Embedding-discrepancy calibration (from epoch-20 validation)
+# Embedding-discrepancy calibration (from epoch-18 re-validation, using the
+# corrected evaluate_decoder(): two-pass decoder refinement, learned_weight
+# fusion, std-based temporal_diff normalization, plateau-centered threshold).
 # These are the per-class means observed during validation.
 # Used as a distribution-robust fallback when classifier is overconfident.
 # ---------------------------------------------------------------------------
-VAL_SIM_REAL = 0.9991   # mean cosine similarity for real videos
-VAL_SIM_FAKE = 0.1601   # mean cosine similarity for fake videos
-VAL_L2_REAL  = 0.0521   # mean L2 distance for real videos
-VAL_L2_FAKE  = 10.7084  # mean L2 distance for fake videos
+VAL_SIM_REAL = 0.9967   # mean cosine similarity for real videos
+VAL_SIM_FAKE = 0.1180   # mean cosine similarity for fake videos
+VAL_L2_REAL  = 0.1292   # mean L2 distance for real videos
+VAL_L2_FAKE  = 11.4191  # mean L2 distance for fake videos
 
 # Midpoints — simple linear thresholds derived from validation means
 _SIM_THRESHOLD = (VAL_SIM_REAL + VAL_SIM_FAKE) / 2   # 0.5796
@@ -343,42 +346,145 @@ _frame_transform = T.Compose([
 ])
 
 
-def preprocess_video(video_path: str) -> torch.Tensor:
+# Hard safety cap purely to avoid unbounded RAM growth on pathological inputs
+# (e.g. a corrupt/mislabeled file that decodes as hours of video). This is
+# NOT a "seconds of video" limit — at 30fps it's ~100 minutes. Training
+# (VideoDataset._load_video_pyav) has no cap at all and decodes every frame,
+# so raise this via MAX_DECODE_FRAMES only if you routinely feed longer clips.
+MAX_DECODE_FRAMES = int(os.getenv("MAX_DECODE_FRAMES", "180000"))
+
+# ---------------------------------------------------------------------------
+# Multi-clip inference — the model architecture (DINOv2VideoEncoder's learned
+# temporal_pos embedding, UNetDecoder3D's bottleneck, VideoEnsembleClassifier's
+# r3d_18/temporal_diff branches) is hardcoded to NUM_FRAMES=8 tokens. You
+# cannot feed it "the whole video" directly — shapes won't match, and the
+# positional embeddings were never trained for indices beyond 8.
+#
+# Instead, multi-clip mode covers the WHOLE video by splitting it into several
+# non-overlapping temporal segments, sampling NUM_FRAMES frames within each
+# segment (exactly like training's single-clip sampling, just windowed), running
+# the full model on each 8-frame clip independently, then aggregating the
+# resulting probabilities. This is the standard approach for applying
+# fixed-length video classifiers to longer inputs.
+# ---------------------------------------------------------------------------
+DEFAULT_MULTI_CLIP_COUNT = int(os.getenv("DEFAULT_MULTI_CLIP_COUNT", "3"))
+MAX_MULTI_CLIP_COUNT     = int(os.getenv("MAX_MULTI_CLIP_COUNT", "10"))
+VALID_CLIP_AGGREGATIONS  = {"mean", "max", "median"}
+
+
+def _decode_video_frames(video_path: str) -> list:
     """
-    Decode a video file and return a normalised tensor ready for inference.
-
-    Pipeline (matches VideoDataset._load_video_pyav exactly):
-      1. Open with PyAV and collect up to 300 decoded frames (prevents OOM on long videos).
-      2. Uniformly sample NUM_FRAMES indices.
-      3. Convert each to RGB PIL Image, apply _frame_transform.
-      4. Stack to [T, C, H, W], unsqueeze to [1, T, C, H, W].
-
-    Returns:
-        Tensor [1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE]
+    Decode every frame of a video with PyAV (up to MAX_DECODE_FRAMES as a
+    safety backstop). Shared by both single-clip and multi-clip preprocessing
+    so the whole video is only decoded once.
     """
     container = av.open(video_path)
     raw_frames = []
-    max_frames = 300  # limit to ~10 seconds at 30fps to avoid RAM exhaustion
-    
+
     try:
         for frame in container.decode(video=0):
             raw_frames.append(frame)
-            if len(raw_frames) >= max_frames:
+            if len(raw_frames) >= MAX_DECODE_FRAMES:
+                logger.warning(
+                    "Video %s exceeded MAX_DECODE_FRAMES=%d — truncating. "
+                    "This should only happen on unusually long/corrupt inputs.",
+                    video_path, MAX_DECODE_FRAMES,
+                )
                 break
     except Exception:
         pass
     finally:
         container.close()
 
-    total = len(raw_frames)
-    if total == 0:
+    if len(raw_frames) == 0:
         raise ValueError(f"No frames could be decoded from: {video_path}")
+    return raw_frames
 
-    indices = np.linspace(0, total - 1, NUM_FRAMES, dtype=int)
+
+def _frames_to_tensor(raw_frames: list, indices: np.ndarray) -> torch.Tensor:
+    """Convert selected raw PyAV frames -> normalised tensor [1, T, C, H, W]."""
     frames = [_frame_transform(raw_frames[i].to_image().convert('RGB')) for i in indices]
-
     video_tensor = torch.stack(frames, dim=0)   # [T, C, H, W]
     return video_tensor.unsqueeze(0)            # [1, T, C, H, W]
+
+
+def _resolve_num_clips(total_frames: int, requested: int) -> int:
+    """
+    Clamp the requested clip count to something sensible for this video:
+    - never more than MAX_MULTI_CLIP_COUNT (latency guard — each clip is a
+      full Layer-3 forward pass, ~1.5s)
+    - never so many that segments would be shorter than NUM_FRAMES (that
+      would just resample near-duplicate frames across "different" clips)
+    """
+    if requested <= 1:
+        return 1
+    max_useful = max(1, total_frames // NUM_FRAMES)
+    return max(1, min(requested, max_useful, MAX_MULTI_CLIP_COUNT))
+
+
+def _sample_clip_indices(total_frames: int, num_frames: int, num_clips: int) -> list:
+    """
+    Split [0, total_frames) into `num_clips` contiguous, non-overlapping
+    segments spanning the entire video, and uniformly sample `num_frames`
+    indices within each segment (same linspace strategy training uses for
+    a single clip, just windowed per-segment).
+    """
+    if num_clips <= 1:
+        return [np.linspace(0, total_frames - 1, num_frames, dtype=int)]
+
+    bounds = np.linspace(0, total_frames, num_clips + 1, dtype=int)
+    clip_indices = []
+    for i in range(num_clips):
+        start, end = int(bounds[i]), int(bounds[i + 1])
+        end = max(end, start + 1)
+        clip_indices.append(np.linspace(start, end - 1, num_frames, dtype=int))
+    return clip_indices
+
+
+def preprocess_video(video_path: str) -> torch.Tensor:
+    """
+    Decode a video file and return a normalised tensor ready for inference.
+
+    Pipeline (matches VideoDataset._load_video_pyav exactly):
+      1. Open with PyAV and decode the WHOLE video (up to MAX_DECODE_FRAMES
+         as a safety backstop, not a routine limit — see comment above).
+      2. Uniformly sample NUM_FRAMES indices across the FULL decoded length,
+         so the 8 sampled frames span the entire clip's duration, not just
+         a truncated prefix.
+      3. Convert each to RGB PIL Image, apply _frame_transform.
+      4. Stack to [T, C, H, W], unsqueeze to [1, T, C, H, W].
+
+    Returns:
+        Tensor [1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE]
+    """
+    raw_frames = _decode_video_frames(video_path)
+    total = len(raw_frames)
+    indices = np.linspace(0, total - 1, NUM_FRAMES, dtype=int)
+    return _frames_to_tensor(raw_frames, indices)
+
+
+def preprocess_video_multi_clip(video_path: str, num_clips: int = DEFAULT_MULTI_CLIP_COUNT):
+    """
+    Decode the WHOLE video once, then split it into several temporal segments
+    and sample one NUM_FRAMES clip per segment, so the model ends up seeing
+    frames spread across the entire video instead of a single 8-frame sample.
+
+    Returns:
+        (clip_tensors, meta) where clip_tensors is a list of
+        [1, NUM_FRAMES, 3, FRAME_SIZE, FRAME_SIZE] tensors and meta describes
+        how many frames/clips were actually used.
+    """
+    raw_frames = _decode_video_frames(video_path)
+    total = len(raw_frames)
+    actual_num_clips = _resolve_num_clips(total, num_clips)
+    clip_index_sets = _sample_clip_indices(total, NUM_FRAMES, actual_num_clips)
+    clip_tensors = [_frames_to_tensor(raw_frames, idx) for idx in clip_index_sets]
+    meta = {
+        "total_decoded_frames": total,
+        "num_clips_requested": num_clips,
+        "num_clips_used": actual_num_clips,
+    }
+    return clip_tensors, meta
 
 
 # ===========================================================================
@@ -473,7 +579,7 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
 
     cls_prob = float(torch.sigmoid(ensemble_logit.squeeze()).item())
 
-    # Embedding-discrepancy score calibrated from epoch-4 validation stats.
+    # Embedding-discrepancy score calibrated from epoch-18 re-validation stats.
     # Normalises l2 and sim onto [0, 1] where 0.0 = real, 1.0 = fake.
     emb_score_l2  = (l2_val     - VAL_L2_REAL)  / max(VAL_L2_FAKE  - VAL_L2_REAL,  1e-6)
     emb_score_sim = (VAL_SIM_REAL - cosine_sim)  / max(VAL_SIM_REAL - VAL_SIM_FAKE, 1e-6)
@@ -493,6 +599,71 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
     }
 
 
+def _aggregate_clip_signals(raw_list: list, aggregation: str = "mean") -> dict:
+    """
+    Combine per-clip `run_inference()` outputs into a single raw signal dict,
+    so the rest of the pipeline (_make_decision, response formatting) doesn't
+    need to know whether one clip or several were run.
+
+    aggregation:
+        "mean"   — average across clips (default; smooths out any single
+                   noisy segment, good general-purpose choice)
+        "max"    — take the most "fake-leaning" clip's cls_prob/emb_score
+                   (higher recall — catches localized manipulation that only
+                   appears in part of the video, at the cost of more false
+                   positives on borderline real content)
+        "median" — robust to a single outlier clip (e.g. one badly compressed
+                   segment) without being as aggressive as max
+    """
+    if aggregation not in VALID_CLIP_AGGREGATIONS:
+        aggregation = "mean"
+
+    reducer = {"mean": np.mean, "max": np.max, "median": np.median}[aggregation]
+
+    cls_probs  = [r["cls_prob"]   for r in raw_list]
+    emb_scores = [r["emb_score"]  for r in raw_list]
+    l2_vals    = [r["l2_val"]     for r in raw_list]
+    cos_sims   = [r["cosine_sim"] for r in raw_list]
+
+    # For "max" aggregation, pick the single clip with the highest cls_prob and
+    # aggregate all of its associated signals together (rather than mixing the
+    # max of cls_prob with the mean of l2/cosine from a different clip, which
+    # would produce an internally inconsistent "details" block).
+    if aggregation == "max":
+        pick = int(np.argmax(cls_probs))
+        cls_prob, emb_score, l2_val, cosine_sim = (
+            cls_probs[pick], emb_scores[pick], l2_vals[pick], cos_sims[pick],
+        )
+        branch_names = raw_list[pick]["branch_probs"].keys()
+    else:
+        cls_prob  = float(reducer(cls_probs))
+        emb_score = float(reducer(emb_scores))
+        l2_val    = float(reducer(l2_vals))
+        cosine_sim = float(reducer(cos_sims))
+        branch_names = raw_list[0]["branch_probs"].keys()
+
+    branch_probs = {
+        name: round(float(reducer([r["branch_probs"].get(name, 0.0) for r in raw_list])), 4)
+        for name in branch_names
+    }
+
+    return {
+        "cls_prob":    cls_prob,
+        "emb_score":   emb_score,
+        "l2_val":      l2_val,
+        "cosine_sim":  cosine_sim,
+        "branch_probs": branch_probs,
+        "per_clip": [
+            {
+                "cls_prob":   round(r["cls_prob"], 4),
+                "emb_score":  round(r["emb_score"], 4),
+            }
+            for r in raw_list
+        ],
+        "aggregation": aggregation,
+    }
+
+
 def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> dict:
     """
     Apply the selected decision strategy to raw inference signals.
@@ -501,8 +672,10 @@ def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> d
     -----
     classifier  (default)
         Use the trained VideoEnsembleClassifier (6-branch ensemble, learned_weight fusion).
-        Calibrated threshold from validation ROC curve (Youden's J statistic).
-        Expected: FPR ~5.4%, FNR ~0.3% at threshold=0.99 on training generators.
+        Calibrated threshold from validation ROC curve (Youden's J statistic,
+        plateau-centered — see embedding_trainer.py's optimal_threshold calc).
+        Expected: FPR ~0.1%, FNR ~0.3% at threshold~0.49 (epoch-18 re-validation
+        on training generators cogvideox/easyanimate/hunyuanvideo/ltxvideo).
 
     embedding
         Use only the embedding-discrepancy score (L2 distance in VideoMAE space).
@@ -531,12 +704,12 @@ def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> d
     prediction = "fake" if prob >= threshold else "real"
 
     # Confidence = distance from the decision threshold (NOT from 0.5).
-    # e.g. with threshold=0.99:
-    #   prob=0.999 → fake,  margin=0.009 → very_high
-    #   prob=0.995 → fake,  margin=0.005 → high
-    #   prob=0.991 → fake,  margin=0.001 → low  (borderline)
-    #   prob=0.985 → real,  margin=0.005 → high  (comfortably real)
-    #   prob=0.50  → real,  margin=0.490 → very_high (clearly real)
+    # e.g. with threshold~0.49 (epoch-18 calibrated optimal_threshold):
+    #   prob=0.55  → fake,  margin=0.06  → very_high
+    #   prob=0.51  → fake,  margin=0.02  → high
+    #   prob=0.495 → fake,  margin=0.005 → low  (borderline)
+    #   prob=0.48  → real,  margin=0.01  → medium
+    #   prob=0.05  → real,  margin=0.44  → very_high (clearly real)
     margin = abs(prob - threshold)
     if margin > 0.05:
         confidence = "very_high"
@@ -569,6 +742,8 @@ def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> d
                 "sim_midpoint":       round(_SIM_THRESHOLD, 4),
             },
             "branch_probabilities":   raw["branch_probs"],
+            **({"per_clip_scores": raw["per_clip"], "clip_aggregation": raw["aggregation"]}
+               if "per_clip" in raw else {}),
         },
     }
 
@@ -591,8 +766,8 @@ app = FastAPI(
     title       = "RA-Det Temporal Video Deepfake Detection API",
     description = (
         "Detects AI-generated / deepfake videos using the RA-Det framework "
-        "with VideoMAE spatiotemporal embeddings and a 3D UNet adversarial decoder. "
-        "Epoch-4 validation — AUC: 0.9959 | Accuracy: 98.10%"
+        "with DINOv2 spatiotemporal embeddings and a 3D UNet adversarial decoder. "
+        "Epoch-18 validation — AUC: 1.0000 | Optimal Accuracy: 99.85%"
     ),
     version  = "1.0.0",
     lifespan = lifespan,
@@ -634,20 +809,28 @@ async def info():
         "checkpoint_epoch": _store.checkpoint_epoch,
         "checkpoint_path":  CHECKPOINT_PATH,
         "load_time_s":      round(_store.load_time_s, 2),
+        # Re-validated on epoch 18 using the FIXED evaluate_decoder() (two-pass
+        # decoder refinement, learned_weight fusion, std-based temporal_diff
+        # normalization, plateau-centered Youden's J threshold). Epoch 18 tied
+        # with epoch 20 on every ranking metric; these numbers reflect whichever
+        # checkpoint is actually loaded as checkpoint_best.pt — update this
+        # block again if a different epoch is promoted later.
         "validation_metrics": {
-            "epoch":              20,
-            "auc":               0.9993,
-            "average_precision": 0.9994,
-            "f1_at_threshold":   0.9722,
-            "accuracy_at_threshold": 0.9715,
-            "fpr_at_threshold":  0.054,
-            "fnr_at_threshold":  0.003,
+            "epoch":              18,
+            "auc":               1.0000,
+            "average_precision": 1.0000,
+            "precision_at_0.5":  0.9990,
+            "recall_at_0.5":     0.9970,
+            "f1_at_0.5":         0.9980,
+            "optimal_accuracy":  0.9985,
             "optimal_threshold": thr,
-            "real_l2":           0.0521,
-            "fake_l2":           10.7084,
-            "l2_gap":            10.6563,
-            "real_sim":          0.9991,
-            "fake_sim":          0.1601,
+            "fpr_at_0.5":        0.0010,
+            "fnr_at_0.5":        0.0030,
+            "real_l2":           0.1292,
+            "fake_l2":           11.4191,
+            "l2_gap":            11.2899,
+            "real_sim":          0.9967,
+            "fake_sim":          0.1180,
         },
         "training_generators": ["cogvideox", "easyanimate", "hunyuanvideo", "ltxvideo"],
         "cascade_layers": {
@@ -667,7 +850,10 @@ async def predict(
     file: UploadFile = File(...),
     mode: str = Query("classifier", description="Decision strategy for Layer 3: classifier, embedding, or hybrid"),
     threshold: Optional[float] = Query(None, description="Custom threshold (0.0 to 1.0). If None, defaults to FAKE_THRESHOLD."),
-    disable_cascade: bool = Query(False, description="Set True to force full Layer 3 RA-Det execution bypassing Layer 1 and Layer 2 short-circuiting.")
+    disable_cascade: bool = Query(False, description="Set True to force full Layer 3 RA-Det execution bypassing Layer 1 and Layer 2 short-circuiting."),
+    multi_clip: bool = Query(False, description="Cover the WHOLE video by splitting it into several temporal segments, running Layer 3 on each, and aggregating. Slower (num_clips x Layer-3 time) but reduces the chance that manipulation is missed outside the single sampled clip."),
+    num_clips: int = Query(DEFAULT_MULTI_CLIP_COUNT, ge=1, le=MAX_MULTI_CLIP_COUNT, description="Number of non-overlapping segments to sample when multi_clip=true. Actual count is clamped based on video length."),
+    clip_aggregation: str = Query("mean", description="How to combine per-clip scores when multi_clip=true: mean, max, or median. 'max' favors recall (flags fake if ANY segment looks fake); 'mean'/'median' are more conservative.")
 ):
     """
     Upload a video file and receive a real/fake prediction through the 3-Layer Cascade.
@@ -676,7 +862,19 @@ async def predict(
     - **Layer 1 (C2PA Provenance)**: Instant (~1ms) digital manifest check for C2PA AI/Camera signatures.
     - **Layer 2 (VideoMAE Anomaly)**: Fast (~200ms) reconstruction MSE check against real camera physics.
     - **Layer 3 (RA-Det Ensemble)**: Deep (~1.5s) 6-branch spatiotemporal ensemble analysis.
+
+    **Multi-clip mode** (`multi_clip=true`): the model architecture only ever
+    consumes 8 frames per forward pass (fixed at training time), so a single
+    call always samples 8 frames from *somewhere* in the video. Multi-clip
+    mode covers the whole video by running several 8-frame windows spread
+    across the full duration and aggregating their scores, instead of relying
+    on one sample.
     """
+    if clip_aggregation not in VALID_CLIP_AGGREGATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid clip_aggregation '{clip_aggregation}'. Choose from: {sorted(VALID_CLIP_AGGREGATIONS)}"
+        )
     if _store.encoder is None:
         raise HTTPException(status_code=503, detail="Models not loaded.")
 
@@ -732,12 +930,21 @@ async def predict(
         # Preprocess Video
         # -------------------------------------------------------------------
         t_prep = time.time()
+        clip_meta = None
         try:
-            video_tensor = preprocess_video(tmp_path)
+            if multi_clip:
+                clip_tensors, clip_meta = preprocess_video_multi_clip(tmp_path, num_clips=num_clips)
+                # Layer 2's anomaly detector only needs one representative clip
+                # (it's a coarse pre-filter, not the deep ensemble) — use the
+                # first temporal segment for that check.
+                video_tensor = clip_tensors[0]
+            else:
+                video_tensor = preprocess_video(tmp_path)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         prep_time = time.time() - t_prep
-        logger.info("Preprocessing: %.2fs", prep_time)
+        logger.info("Preprocessing: %.2fs%s", prep_time,
+                    f" (multi_clip: {clip_meta})" if clip_meta else "")
 
         # -------------------------------------------------------------------
         # LAYER 2: VideoMAE Anomaly Reconstruction Error Check (~200ms)
@@ -768,11 +975,17 @@ async def predict(
         # LAYER 3: RA-Det 6-Branch Spatiotemporal Ensemble (~1.5s)
         # -------------------------------------------------------------------
         t_l3 = time.time()
-        raw = run_inference(video_tensor)
+        if multi_clip:
+            per_clip_raw = [run_inference(ct) for ct in clip_tensors]
+            raw = _aggregate_clip_signals(per_clip_raw, aggregation=clip_aggregation)
+        else:
+            raw = run_inference(video_tensor)
         # Use the calibrated threshold from the checkpoint (fixes high FPR from hard-coded 0.5).
         # User can still override per-request via the ?threshold= query param.
         active_threshold = threshold if threshold is not None else _store.optimal_threshold
         result = _make_decision(raw, mode, threshold=active_threshold)
+        if multi_clip:
+            result["multi_clip"] = clip_meta
         l3_time = time.time() - t_l3
 
         total_s = time.time() - t_start

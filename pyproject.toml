@@ -17,6 +17,9 @@ dependencies = [
     "scikit-learn>=1.0.0",
     "scipy>=1.7.0",
 
+    # Visualization (test_model_reliability.py plots)
+    "matplotlib>=3.5.0",
+
     # Progress bars
     "tqdm>=4.62.0",
 
