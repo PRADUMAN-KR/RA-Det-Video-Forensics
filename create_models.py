@@ -45,7 +45,6 @@ class DINOv2Wrapper(nn.Module):
         self.model_name = model_name
         self.output_dim = model.embed_dim if hasattr(model, 'embed_dim') else 1024
 
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
     def encode_image(self, image):
         """Encode images to embeddings."""
         # Note: Not using torch.no_grad() to allow gradient flow for training

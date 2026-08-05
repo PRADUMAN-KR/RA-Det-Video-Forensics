@@ -157,7 +157,6 @@ class DINOv2VideoEncoder(nn.Module):
         combined = torch.cat([mean_feat, std_feat, drift, jerk], dim=-1)  # [B, 4*D]
         return self.temporal_stats_proj(combined)  # [B, D]
 
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
     def encode_video_detailed(
         self, video_tensor: torch.Tensor
     ) -> tuple:
@@ -173,6 +172,10 @@ class DINOv2VideoEncoder(nn.Module):
             temporal_output:  [B, T, D] temporal transformer output
         """
         assert video_tensor.dim() == 5, f"Expected 5D [B, T, C, H, W], got {video_tensor.dim()}D"
+        target_device = next(self.dino.parameters()).device
+        if video_tensor.device != target_device:
+            video_tensor = video_tensor.to(target_device)
+
         B, T, C, H, W = video_tensor.shape
 
         # Process all frames through DINOv2 in a single batch

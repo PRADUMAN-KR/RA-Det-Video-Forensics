@@ -35,7 +35,6 @@ class VideoMAEWrapper(nn.Module):
         self.output_dim = self.model.config.hidden_size  # Typically 1024 for Large, 768 for Base
         print(f"VideoMAE model loaded successfully. Embedding dimension: {self.output_dim}")
 
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
     def encode_video(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
         Encode video frames to spatiotemporal embeddings.
@@ -49,6 +48,9 @@ class VideoMAEWrapper(nn.Module):
             embeddings: Video level embeddings of shape [B, D].
         """
         assert video_tensor.dim() == 5, f"Expected 5D [B, T, C, H, W], got {video_tensor.dim()}D"
+        target_device = next(self.model.parameters()).device
+        if video_tensor.device != target_device:
+            video_tensor = video_tensor.to(target_device)
 
         # IMPORTANT: Do NOT gate on requires_grad here.
         #

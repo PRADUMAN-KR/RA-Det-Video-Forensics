@@ -45,10 +45,26 @@ class ReconstructionHead3D(nn.Module):
             nn.Tanh()
         )
 
-    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+    def forward(self, embedding: torch.Tensor, num_frames: Optional[int] = None) -> torch.Tensor:
+        target_frames = num_frames or self.num_frames
         B = embedding.shape[0]
         x = self.fc(embedding).view(B, 512, 2, 7, 7)
-        reconstructed = self.deconv(x)  # [B, 3, T, H, W]
+        reconstructed = self.deconv(x)  # [B, 3, T', H, W]
+
+        # NOTE: The ConvTranspose3d stack above has fixed kernel/stride/padding,
+        # so its output temporal length is NOT actually driven by self.num_frames
+        # (with a T=2 latent it always produces T'=9, not 16 as the block
+        # comments assume). Resize to the requested frame count explicitly so
+        # the reconstruction always matches whatever T the caller's video has,
+        # regardless of NUM_FRAMES config drift.
+        if reconstructed.shape[2] != target_frames:
+            reconstructed = F.interpolate(
+                reconstructed,
+                size=(target_frames, self.frame_size, self.frame_size),
+                mode="trilinear",
+                align_corners=False,
+            )
+
         # Permute to [B, T, 3, H, W] to match video tensor
         return reconstructed.permute(0, 2, 1, 3, 4)
 
@@ -70,6 +86,12 @@ class VideoAnomalyDetector(nn.Module):
         self.low_threshold = 0.06   # Below this -> High confidence REAL
         self.high_threshold = 0.14  # Above this -> High confidence FAKE
 
+        try:
+            device = next(encoder.parameters()).device
+            self.recon_head = self.recon_head.to(device)
+        except (StopIteration, AttributeError):
+            pass
+
         if checkpoint_path and os.path.exists(checkpoint_path):
             ckpt = torch.load(checkpoint_path, map_location="cpu")
             if "recon_head_state_dict" in ckpt:
@@ -83,14 +105,21 @@ class VideoAnomalyDetector(nn.Module):
         """
         Compute reconstruction error (MSE) for input video tensor [1, T, C, H, W].
         """
-        device = next(self.recon_head.parameters()).device
+        try:
+            device = next(self.encoder.parameters()).device
+        except (StopIteration, AttributeError):
+            device = next(self.recon_head.parameters()).device
+
+        self.recon_head = self.recon_head.to(device)
         video = video_tensor.to(device)
 
         # Extract frozen VideoMAE embedding
         clean_emb = self.encoder(video)  # [1, D]
 
-        # Reconstruct video frames
-        reconstructed_video = self.recon_head(clean_emb)  # [1, T, C, H, W]
+        # Reconstruct video frames, matching the actual number of frames in `video`
+        # (avoids shape mismatches when NUM_FRAMES differs from the head's default).
+        num_frames = video.shape[1]
+        reconstructed_video = self.recon_head(clean_emb, num_frames=num_frames)  # [1, T, C, H, W]
 
         # Compute MSE loss per sample
         mse = F.mse_loss(video, reconstructed_video, reduction="mean").item()

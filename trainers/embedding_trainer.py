@@ -596,10 +596,22 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                 # Extract embeddings using VideoMAE
                 clean_embeddings = encoder(video)
 
-                # Generate spatiotemporal noise
+                # Two-pass decoder refinement — MUST match train_epoch() exactly.
+                # The decoder is trained so its loss always comes from a SECOND pass
+                # that contrasts clean vs. perturbed embeddings in the cross-attention
+                # bottleneck; the first pass alone is only a self-attention warm-up.
+                # Evaluating just the first pass scores a decoder configuration the
+                # model was never actually optimized to produce.
                 noise = decoder(original_video=video_c_first, clean_embedding=clean_embeddings)
+                perturbed_video_ref = (video_c_first + noise).permute(0, 2, 1, 3, 4)
+                noisy_embeddings_ref = encoder(perturbed_video_ref)
+                noise = decoder(
+                    original_video=video_c_first,
+                    clean_embedding=clean_embeddings,
+                    noisy_embedding=noisy_embeddings_ref,
+                )
 
-                # Extract perturbed embeddings
+                # Extract perturbed embeddings from the refined (second-pass) noise.
                 perturbed_video = (video_c_first + noise).permute(0, 2, 1, 3, 4)
                 noisy_embeddings = encoder(perturbed_video)
 
@@ -659,12 +671,21 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
 
                 if is_video:
                     # NOTE: LPD is 2D-only; skip in video mode
-                    # Compute temporal difference frames [B, C, T, H, W]
+                    #
+                    # IMPORTANT — must match run_inference()/train_epoch() EXACTLY.
+                    # This normalization previously used a max-abs scale
+                    # (temporal_diff / |temporal_diff|.amax()), which differs from the
+                    # std-based scale used in train_epoch() and inference_api.py's
+                    # run_inference(). Two different normalizations produce two different
+                    # input distributions for the scratch branch, so the ROC-calibrated
+                    # optimal_threshold saved to the checkpoint would not correspond to the
+                    # probabilities inference actually produces. Kept identical here so the
+                    # calibrated threshold is valid for production inference.
                     frame_diffs = video[:, 1:] - video[:, :-1]                          # [B, T-1, C, H, W]
                     frame_diffs = torch.cat([frame_diffs, frame_diffs[:, -1:]], dim=1)  # [B, T,   C, H, W]
                     temporal_diff = frame_diffs.permute(0, 2, 1, 3, 4).contiguous()    # [B, C, T, H, W]
-                    td_max = temporal_diff.abs().amax(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
-                    temporal_diff = temporal_diff / td_max
+                    td_std = temporal_diff.std(dim=(2, 3, 4), keepdim=True).clamp(min=1e-4)
+                    temporal_diff = (temporal_diff / (3.0 * td_std)).clamp(-1.0, 1.0)
 
                     # Compute per-frame features and NPR features for video branches
                     if hasattr(encoder, "encode_video_detailed"):
@@ -686,7 +707,13 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                         "npr_features": npr_features_eval,
                     }
 
-                    outputs = classifier_model(use_max_for_eval=True, **inputs)
+                    # IMPORTANT — use_max_for_eval=True forces MaxFusion regardless of the
+                    # classifier's configured fusion_method. inference_api.py always uses
+                    # the classifier's real fusion_method (e.g. "learned_weight" for
+                    # dinov2_temporal_v1), never MaxFusion. Calibrating the ROC threshold
+                    # against MaxFusion probabilities while serving learned_weight
+                    # probabilities in production made the saved optimal_threshold invalid.
+                    outputs = classifier_model(use_max_for_eval=False, **inputs)
                     if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
                         ensemble_logits, branch_logits = outputs
                     else:
@@ -951,25 +978,23 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
                     fnr = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
 
-                    # Calculate optimal accuracy by finding best threshold
+                    # Calculate optimal threshold using Youden's J statistic: max(TPR - FPR).
+                    # This is numerically stable and avoids the float32 saturation bug where
+                    # sigmoid outputs saturate to exactly 1.0, causing sklearn's roc_curve to
+                    # prepend an artificial threshold of 1.0+ε that gets incorrectly selected
+                    # as "optimal" by the old accuracy-loop approach.
                     fpr_curve, tpr_curve, thresholds = roc_curve(gen_labels, gen_probs)
-                    accuracies = []
-                    for threshold in thresholds:
-                        predictions = (gen_probs >= threshold).astype(int)
-                        acc = accuracy_score(gen_labels, predictions)
-                        accuracies.append(acc)
+                    j_scores = tpr_curve - fpr_curve   # Youden's J for each threshold
+                    best_idx = int(np.argmax(j_scores))
+                    # Clamp to (0, 1) open interval — sigmoid can never equal 0.0 or 1.0 exactly
+                    raw_threshold = float(thresholds[best_idx])
+                    optimal_threshold = float(np.clip(raw_threshold, 0.01, 0.99))
 
-                    if len(accuracies) > 0:
-                        optimal_acc = max(accuracies)
-                        optimal_threshold = thresholds[accuracies.index(optimal_acc)]
-                        opt_preds = (gen_probs >= optimal_threshold).astype(int)
-                        optimal_prec = precision_score(gen_labels, opt_preds, zero_division=0)
-                        optimal_rec = recall_score(gen_labels, opt_preds, zero_division=0)
-                    else:
-                        optimal_acc = 0.0
-                        optimal_threshold = 0.5
-                        optimal_prec = 0.0
-                        optimal_rec = 0.0
+                    # Compute accuracy and precision/recall at this optimal threshold
+                    opt_preds = (gen_probs >= optimal_threshold).astype(int)
+                    optimal_acc = float(accuracy_score(gen_labels, opt_preds))
+                    optimal_prec = precision_score(gen_labels, opt_preds, zero_division=0)
+                    optimal_rec = recall_score(gen_labels, opt_preds, zero_division=0)
                 except Exception as e:
                     print(f"  [Eval Warning] Metric calculation failed for '{generator}': {e}")
                     auc = 0.0
@@ -1017,6 +1042,36 @@ class CrossGeneratorEvaluator(BaseCrossGeneratorEvaluator):
                     metrics['num_fake'] = int(fake_mask.sum())
 
                 generator_metrics[generator] = metrics
+
+        # ── Threshold Sweep (printed after all per-generator metrics) ─────────
+        # Sweep thresholds 0.30 → 0.99 in 0.01 steps using the 'overall' split.
+        # No extra inference needed — probabilities are already in memory.
+        if self.rank == 0 and 'overall' in generators_to_eval:
+            overall_indices = generators_to_eval['overall']
+            sweep_labels = all_labels[overall_indices].reshape(-1)
+            sweep_probs  = all_probs[overall_indices].reshape(-1)
+
+            thresholds_sweep = np.arange(0.30, 1.00, 0.01)
+            print(f"\n{'='*95}")
+            print(f"THRESHOLD SWEEP (Overall — {len(sweep_labels)} samples)")
+            print(f"{'='*95}")
+            print(f"{'Thresh':>7} | {'TN':>5} {'FP':>5} {'FN':>5} {'TP':>5} | "
+                  f"{'FPR%':>6} {'FNR%':>6} | {'Prec':>6} {'Rec':>6} {'F1':>6} | {'Acc%':>6}")
+            print(f"{'-'*95}")
+            for thr in thresholds_sweep:
+                preds = (sweep_probs >= thr).astype(int)
+                cm_s  = confusion_matrix(sweep_labels, preds, labels=[0, 1])
+                s_tn, s_fp, s_fn, s_tp = [int(v) for v in cm_s.ravel()]
+                s_fpr  = 100.0 * s_fp / (s_fp + s_tn) if (s_fp + s_tn) > 0 else 0.0
+                s_fnr  = 100.0 * s_fn / (s_fn + s_tp) if (s_fn + s_tp) > 0 else 0.0
+                s_prec = precision_score(sweep_labels, preds, zero_division=0)
+                s_rec  = recall_score(sweep_labels, preds, zero_division=0)
+                s_f1   = f1_score(sweep_labels, preds, zero_division=0)
+                s_acc  = 100.0 * (s_tn + s_tp) / len(sweep_labels)
+                print(f"  {thr:.2f}  | {s_tn:>5} {s_fp:>5} {s_fn:>5} {s_tp:>5} | "
+                      f"{s_fpr:>5.1f}% {s_fnr:>5.1f}% | "
+                      f"{s_prec:>6.4f} {s_rec:>6.4f} {s_f1:>6.4f} | {s_acc:>5.2f}%")
+            print(f"{'='*95}")
 
         # Synchronize all ranks after metric computation
         if self.world_size > 1 and dist.is_available() and dist.is_initialized():
@@ -2557,6 +2612,12 @@ class EmbeddingTrainer:
         if self.eps_randomization:
             self.update_decoder_eps(prev_eps)
 
+        # Persist the overall optimal threshold for checkpoint saving
+        if generator_metrics and self.rank == 0:
+            overall_m = generator_metrics.get('overall', None)
+            if overall_m and 'optimal_threshold' in overall_m:
+                self.best_optimal_threshold = overall_m['optimal_threshold']
+
         # Aggregate metrics across all generators
         metrics = {}
         if generator_metrics:
@@ -2643,7 +2704,7 @@ class EmbeddingTrainer:
                         print(f"    precision: {gen_metrics['precision']:.4f} | recall: {gen_metrics['recall']:.4f} | f1: {gen_metrics['f1_score']:.4f}")
                     if 'tp' in gen_metrics:
                         print(f"    matrix: TN={gen_metrics['tn']}, FP={gen_metrics['fp']}, FN={gen_metrics['fn']}, TP={gen_metrics['tp']}")
-                    print(f"    optimal_accuracy: {gen_metrics['optimal_accuracy']:.4f}")
+                    print(f"    optimal_accuracy: {gen_metrics['optimal_accuracy']:.4f} | optimal_threshold: {gen_metrics.get('optimal_threshold', 0.5):.4f}")
 
                     if 'similarity_real' in gen_metrics:
                         print(f"      real - similarity: {gen_metrics['similarity_real']:.4f}, l2: {gen_metrics['l2_distance_real']:.4f}")
@@ -2696,6 +2757,9 @@ class EmbeddingTrainer:
             'training_mode': getattr(self, 'training_mode', 'embedding_only'),
             'lambda_classification': getattr(self, 'lambda_classification', 0.0),
             'best_val_similarity': getattr(self, 'best_val_similarity', float('inf')),
+            # Optimal classifier threshold calibrated on the validation ROC curve.
+            # Use this in inference instead of the hard-coded 0.5 to fix the high FPR.
+            'optimal_threshold': getattr(self, 'best_optimal_threshold', 0.5),
         }
 
         if self.classifier is not None:
@@ -2728,13 +2792,16 @@ class EmbeddingTrainer:
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_val_similarity = checkpoint.get('best_val_similarity', float('inf'))
+        self.best_optimal_threshold = checkpoint.get('optimal_threshold', 0.5)
 
         if 'classifier_state_dict' in checkpoint and self.classifier is not None:
             classifier_state = checkpoint['classifier_state_dict']
             if self.is_ddp:
-                self.classifier.module.load_state_dict(classifier_state)
+                missing, unexpected = self.classifier.module.load_state_dict(classifier_state, strict=False)
             else:
-                self.classifier.load_state_dict(classifier_state)
+                missing, unexpected = self.classifier.load_state_dict(classifier_state, strict=False)
+            if self.rank == 0 and unexpected:
+                print(f"  [Checkpoint] Ignored {len(unexpected)} unexpected classifier key(s) (architecture mismatch — OK for validate-only): {unexpected[:3]}{'...' if len(unexpected) > 3 else ''}")
 
         # Load classifier optimizer state if available
         if load_optimizers and 'classifier_optimizer_state_dict' in checkpoint and self.classifier_optimizer is not None:

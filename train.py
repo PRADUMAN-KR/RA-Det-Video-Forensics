@@ -424,6 +424,18 @@ def validate_only(config, checkpoint_path):
         for key, value in val_metrics.items():
             print(f"  {key}: {value:.4f}")
 
+        # Patch the calibrated optimal_threshold back into the checkpoint so
+        # inference_api.py can load it automatically (fixes the FPR from hardcoded 0.5).
+        calibrated_threshold = getattr(trainer, 'best_optimal_threshold', None)
+        if calibrated_threshold is not None and 0.0 < calibrated_threshold < 1.0:
+            print(f"\nPatching checkpoint with calibrated threshold: {calibrated_threshold:.4f}")
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
+            ckpt['optimal_threshold'] = calibrated_threshold
+            torch.save(ckpt, checkpoint_path)
+            print(f"  ✓ Saved patched checkpoint to: {checkpoint_path}")
+        else:
+            print(f"\n  ⚠ Could not patch checkpoint: invalid threshold value ({calibrated_threshold})")
+
     # Cleanup
     cleanup_ddp()
 

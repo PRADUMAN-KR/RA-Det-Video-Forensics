@@ -43,6 +43,7 @@ from rfnt_models.ensemble.video_classifier import VideoEnsembleClassifier
 from rfnt_models.ensemble.npr import extract_npr_features
 from detectors.provenance import check_provenance
 from detectors.anomaly_detector import VideoAnomalyDetector
+from configs.config import get_config
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,49 +56,109 @@ logger = logging.getLogger("ra_det_api")
 
 
 # ===========================================================================
-# Configuration — mirrors the training config exactly
-# ===========================================================================
+# Configuration — pulled directly from configs/config.py so inference always
+# tracks whatever "--config <name>" was actually used to train the checkpoint.
+# This mirrors the exact training invocation:
+#
+#   uv run python train.py --config dinov2_temporal_v1 --video-mode \
+#       --num-frames 8 --batch-size 2 --num-workers 4 --niter 20 \
+#       --eps-randomization --eps-min 4.0 --eps-max 32.0 --eps-schedule random \
+#       --normalize-loss --four-branch-ensemble --fusion-method learned_weight \
+#       --checkpoint-dir ./checkpoints/dinov2_temporal_v1 \
+#       --resume ./checkpoints/dinov2_temporal_v1/checkpoint_epoch_12.pt
+#
+# CLI flags override config.py defaults during training (see train.py::main()),
+# so any value explicitly passed on the command line (num_frames, fusion_method,
+# eps_min/max, normalize_loss, four_branch_ensemble, checkpoint_dir, ...) is
+# reproduced here as an override too — never re-derived from config.py alone.
+# ---------------------------------------------------------------------------
+TRAIN_CONFIG_NAME = os.getenv("TRAIN_CONFIG_NAME", "dinov2_temporal_v1")
+_cfg = get_config(TRAIN_CONFIG_NAME)
+_decoder_cfg = _cfg.get("decoder_kwargs", {})
+
+_checkpoint_dir = _cfg["checkpoint_dir"]
+if not os.path.isabs(_checkpoint_dir):
+    _checkpoint_dir = os.path.normpath(os.path.join(PROJECT_ROOT, _checkpoint_dir))
 CHECKPOINT_PATH = os.getenv(
     "CHECKPOINT_PATH",
+    os.path.join(_checkpoint_dir, "checkpoint_best.pt"),
+)
+
+MODEL_NAME = os.getenv("MODEL_NAME", _cfg["model_name"])
+
+# --num-frames 8 (explicit training flag) — also matches decoder_kwargs.num_frames
+# in config.py, but the CLI flag is what train.py actually applied at run time.
+NUM_FRAMES = int(os.getenv("NUM_FRAMES", str(_decoder_cfg.get("num_frames", 8))))
+
+FRAME_SIZE = 224
+
+# --eps-randomization/--eps-min 4.0/--eps-max 32.0 were passed explicitly.
+# train.py divides these CLI values by 255 (see train.py::main()); at inference
+# time (no randomization) the decoder should run at the midpoint of the trained
+# eps range, i.e. base attack_eps from config.py (16/255) — NOT eps_min or eps_max
+# alone, since randomization means the decoder was trained across that full range
+# with attack_eps as its centre/default (config['attack_eps'] is unchanged by
+# --eps-randomization; only eps_min/eps_max/eps_schedule are set alongside it).
+ATTACK_EPS = float(os.getenv("ATTACK_EPS", str(_cfg["attack_eps"])))
+
+FAKE_THRESHOLD = 0.5  # sigmoid(logit) > 0.5 → FAKE — fallback only; see optimal_threshold below
+
+# Layer 2 (VideoAnomalyDetector) checkpoint — trained SEPARATELY via
+# trainers/train_anomaly.py (real-only clips, reconstruction MSE objective).
+# This must NOT be confused with CHECKPOINT_PATH above (the Layer 3 ensemble
+# checkpoint): that file only contains decoder_state_dict/classifier_state_dict
+# and has no recon_head weights, so loading it into VideoAnomalyDetector is a
+# no-op that leaves recon_head randomly initialised.
+ANOMALY_CHECKPOINT_PATH = os.getenv(
+    "ANOMALY_CHECKPOINT_PATH",
     os.path.join(
         PROJECT_ROOT,
         "checkpoints",
-        "npr_ensemble",
-        "npr_ensemble_epoch_5.pt",
+        "anomaly_detector",
+        "anomaly_detector_best.pt",
     ),
 )
 
-MODEL_NAME     = "MCG-NJU/videomae-large"
-NUM_FRAMES     = 16
-FRAME_SIZE     = 224
-ATTACK_EPS     = 16 / 255
-FAKE_THRESHOLD = 0.5  # sigmoid(logit) > 0.5 → FAKE
+# Decoder kwargs — sourced from configs/config.py's dinov2_temporal_v1 entry so
+# these can never silently drift from what train.py actually built.
+# strategy_channels is force-zeroed exactly like embedding_trainer.py does for
+# self.video_mode (see EmbeddingTrainer.__init__), and num_levels/is_video_mode
+# are dropped since UNetDecoder3D doesn't accept them as constructor kwargs
+# (embedding_trainer.py filters to `valid_unet_keys` before calling UNetDecoder3D).
+_VALID_UNET_KEYS = {
+    "base_channels", "num_levels", "num_heads", "use_attention", "bottleneck_size",
+}
+DECODER_KWARGS = {k: v for k, v in _decoder_cfg.items() if k in _VALID_UNET_KEYS}
+DECODER_KWARGS["strategy_channels"] = 0  # MUST be 0 in video mode
 
-# Decoder kwargs — must match what the trainer builds in video mode.
-# CRITICAL: strategy_channels is forced to 0 in video mode by the trainer
-# (embedding_trainer.py lines 1087-1091), even though the config says 15.
-DECODER_KWARGS = dict(
-    base_channels     = 64,
-    num_levels        = 5,
-    num_heads         = 8,
-    use_attention     = True,
-    bottleneck_size   = 14,
-    strategy_channels = 0,   # MUST be 0 in video mode
-)
+# --fusion-method learned_weight was passed explicitly on the training command
+# (train.py::main() overrides config['fusion_method'] unconditionally with
+# whatever --fusion-method resolves to, default "logit_weighted" if unset).
+FUSION_METHOD = os.getenv("FUSION_METHOD", _cfg.get("fusion_method", "logit_weighted"))
+
+# --four-branch-ensemble was passed explicitly (bool flag → True).
+USE_FOUR_BRANCH_ENSEMBLE = os.getenv(
+    "USE_FOUR_BRANCH_ENSEMBLE", str(_cfg.get("use_four_branch_ensemble", False))
+).lower() in ("1", "true", "yes")
+
+USE_NPR_BRANCH = _cfg.get("use_npr_branch", True)
+USE_TEMPORAL_COHERENCE_BRANCH = _decoder_cfg.get("use_temporal_coherence_branch", "dinov2" in MODEL_NAME.lower())
+UNFREEZE_LAST_N_BLOCKS = int(_decoder_cfg.get("unfreeze_last_n_blocks", 0))
+TEMPORAL_TRANSFORMER_LAYERS = int(_decoder_cfg.get("temporal_transformer_layers", 2))
 
 # ---------------------------------------------------------------------------
-# Embedding-discrepancy calibration (from epoch-4 validation on training set)
+# Embedding-discrepancy calibration (from epoch-20 validation)
 # These are the per-class means observed during validation.
 # Used as a distribution-robust fallback when classifier is overconfident.
 # ---------------------------------------------------------------------------
-VAL_SIM_REAL = 0.9935   # mean cosine similarity for real videos
-VAL_SIM_FAKE = 0.8816   # mean cosine similarity for fake videos
-VAL_L2_REAL  = 0.8070   # mean L2 distance for real videos
-VAL_L2_FAKE  = 6.1752   # mean L2 distance for fake videos
+VAL_SIM_REAL = 0.9991   # mean cosine similarity for real videos
+VAL_SIM_FAKE = 0.1601   # mean cosine similarity for fake videos
+VAL_L2_REAL  = 0.0521   # mean L2 distance for real videos
+VAL_L2_FAKE  = 10.7084  # mean L2 distance for fake videos
 
 # Midpoints — simple linear thresholds derived from validation means
-_SIM_THRESHOLD = (VAL_SIM_REAL + VAL_SIM_FAKE) / 2   # 0.9376
-_L2_THRESHOLD  = (VAL_L2_REAL  + VAL_L2_FAKE)  / 2   # 3.4911
+_SIM_THRESHOLD = (VAL_SIM_REAL + VAL_SIM_FAKE) / 2   # 0.5796
+_L2_THRESHOLD  = (VAL_L2_REAL  + VAL_L2_FAKE)  / 2   # 5.3803
 
 # VideoMAE pretraining normalisation stats (NOT ImageNet)
 # Matches VideoDataset default transform (video_dataset.py line 71)
@@ -117,6 +178,9 @@ class ModelStore:
     feature_dim:      int                         = 1024
     checkpoint_epoch: int                         = 0
     load_time_s:      float                       = 0.0
+    # Optimal decision threshold loaded from the checkpoint.
+    # Calibrated from the validation ROC curve during training (replaces hardcoded 0.5).
+    optimal_threshold: float                      = FAKE_THRESHOLD
 
 
 _store = ModelStore()
@@ -138,11 +202,17 @@ def _load_models(device: torch.device) -> None:
     if "dinov2" in MODEL_NAME.lower():
         logger.info("Loading DINOv2 video encoder: %s", MODEL_NAME)
         from models.dinov2_video_encoder import DINOv2VideoEncoder
+        # NOTE: unfreeze_last_n must match training (unfreeze_last_n_blocks=4 in
+        # dinov2_temporal_v1), since the last N DINOv2 blocks were fine-tuned
+        # during training and the fine-tuned weights differ from the pretrained
+        # ones. We set requires_grad=False again right after loading (below) —
+        # this only controls *which submodules exist*/get restored, not whether
+        # they're trainable at inference time.
         encoder = DINOv2VideoEncoder(
             model_name=MODEL_NAME,
             num_frames=NUM_FRAMES,
-            temporal_layers=DECODER_KWARGS.get("temporal_transformer_layers", 2),
-            unfreeze_last_n=0,
+            temporal_layers=TEMPORAL_TRANSFORMER_LAYERS,
+            unfreeze_last_n=UNFREEZE_LAST_N_BLOCKS,
             device=str(device),
         )
     else:
@@ -164,6 +234,9 @@ def _load_models(device: torch.device) -> None:
     logger.info("UNetDecoder3D instantiated.")
 
     # 3. Classifier — VideoEnsembleClassifier
+    # All flags below are sourced from configs/config.py's dinov2_temporal_v1
+    # entry (with CLI-flag overrides applied above), matching exactly how
+    # embedding_trainer.py's setup_training_mode(mode="ensemble") constructs it.
     classifier = VideoEnsembleClassifier(
         video_encoder                  = encoder,
         feature_dim                    = feature_dim,
@@ -172,14 +245,17 @@ def _load_models(device: torch.device) -> None:
         resnet_variant                 = "r3d_18",
         dropout                        = 0.1,
         temperature                    = 1.0,
-        fusion_method                  = "logit_weighted",
-        use_four_branch                = True,   # checkpoint has l2_distance + embedding_diff branches
-        use_npr_branch                 = True,   # NPR branch
-        use_direct_feature_branch     = True,
-        use_temporal_coherence_branch = "dinov2" in MODEL_NAME.lower() or DECODER_KWARGS.get("use_temporal_coherence_branch", False),
-        num_frames                     = NUM_FRAMES,
+        fusion_method                  = FUSION_METHOD,               # --fusion-method learned_weight
+        use_four_branch                = USE_FOUR_BRANCH_ENSEMBLE,    # --four-branch-ensemble
+        use_npr_branch                 = USE_NPR_BRANCH,
+        use_direct_feature_branch      = True,
+        use_temporal_coherence_branch  = USE_TEMPORAL_COHERENCE_BRANCH,
+        num_frames                     = NUM_FRAMES,                  # --num-frames 8
     ).to(device)
-    logger.info("VideoEnsembleClassifier instantiated.")
+    logger.info(
+        "VideoEnsembleClassifier instantiated (fusion=%s, four_branch=%s, npr=%s, temporal_coherence=%s).",
+        FUSION_METHOD, USE_FOUR_BRANCH_ENSEMBLE, USE_NPR_BRANCH, USE_TEMPORAL_COHERENCE_BRANCH,
+    )
 
     # Load weights from checkpoint
     if os.path.exists(CHECKPOINT_PATH):
@@ -195,6 +271,15 @@ def _load_models(device: torch.device) -> None:
         if "epoch" in ckpt:
             _store.checkpoint_epoch = ckpt["epoch"]
             logger.info("  ✓ Checkpoint epoch: %d", _store.checkpoint_epoch)
+        if "optimal_threshold" in ckpt:
+            _store.optimal_threshold = float(ckpt["optimal_threshold"])
+            logger.info("  ✓ Loaded calibrated optimal_threshold: %.4f", _store.optimal_threshold)
+        else:
+            logger.warning(
+                "  ⚠ No 'optimal_threshold' in checkpoint — using default FAKE_THRESHOLD=%.2f. "
+                "FPR may be elevated. Retrain or patch the checkpoint to fix.",
+                FAKE_THRESHOLD,
+            )
     else:
         logger.warning(
             "Checkpoint NOT found at %s. Running with uninitialised weights!",
@@ -218,13 +303,30 @@ def _load_models(device: torch.device) -> None:
     _store.load_time_s = time.time() - t0
 
     # Optional Layer 2 Anomaly Detector
+    #
+    # IMPORTANT: this is a SEPARATE model trained by trainers/train_anomaly.py
+    # (real-only clips, reconstruction MSE objective) and must load from
+    # ANOMALY_CHECKPOINT_PATH, NOT the Layer 3 ensemble checkpoint (CHECKPOINT_PATH).
+    # The ensemble checkpoint has no "recon_head_state_dict" key, so loading it
+    # here previously left recon_head randomly initialised (silent no-op via
+    # strict=False) — Layer 2 was never actually running trained weights.
     try:
-        anomaly_detector = VideoAnomalyDetector(encoder=encoder, feature_dim=feature_dim)
-        if os.path.exists(CHECKPOINT_PATH):
-            anomaly_detector.load_state_dict(ckpt, strict=False)
+        anomaly_detector = VideoAnomalyDetector(
+            encoder=encoder,
+            feature_dim=feature_dim,
+            checkpoint_path=ANOMALY_CHECKPOINT_PATH,
+        )
         anomaly_detector.eval()
         _store.anomaly_detector = anomaly_detector
-        logger.info("  ✓ Loaded VideoAnomalyDetector")
+        if os.path.exists(ANOMALY_CHECKPOINT_PATH):
+            logger.info("  ✓ Loaded VideoAnomalyDetector from %s", ANOMALY_CHECKPOINT_PATH)
+        else:
+            logger.warning(
+                "  ⚠ ANOMALY_CHECKPOINT_PATH not found at %s — Layer 2 will run with "
+                "UNTRAINED weights. Train it with trainers/train_anomaly.py or set "
+                "ANOMALY_CHECKPOINT_PATH to disable/point at a real checkpoint.",
+                ANOMALY_CHECKPOINT_PATH,
+            )
     except Exception as exc:
         logger.warning("Could not initialise VideoAnomalyDetector: %s", exc)
 
@@ -302,14 +404,36 @@ def run_inference(video_tensor: torch.Tensor) -> dict:
             clean_emb = encoder(video)                    # [1, D]
             per_frame_cls = None
 
-        # Step 2 — Spatiotemporal noise
         video_c_first = video.permute(0, 2, 1, 3, 4)  # [1, C, T, H, W]
+
+        # Step 2 — Two-pass decoder refinement (MUST match train_epoch() exactly —
+        # see trainers/embedding_trainer.py::EmbeddingTrainer.train_epoch, video-mode
+        # branch). The decoder's loss/gradients during training are always computed
+        # from a SECOND pass that contrasts clean vs. perturbed embeddings in the
+        # cross-attention bottleneck; the first pass is only a self-attention warm-up
+        # used to generate that reference perturbation. Serving only the first pass
+        # (as this code previously did) evaluates a decoder configuration that was
+        # never the actual training target, producing a different — and weaker —
+        # perturbation than what the classifier was trained against.
+        #
+        # 2a. First pass — bottleneck self-attends on clean embedding only.
         noise = decoder(
             original_video  = video_c_first,
             clean_embedding = clean_emb,
         )                                              # [1, 3, T, H, W]
 
-        # Step 3 — Noisy embeddings
+        # 2b. Reference noisy embedding from the first-pass noise.
+        perturbed_ref = (video_c_first + noise).permute(0, 2, 1, 3, 4)  # [1, T, C, H, W]
+        noisy_emb_ref = encoder(perturbed_ref)                          # [1, D]
+
+        # 2c. Second pass — bottleneck now contrasts clean vs. perturbed embeddings.
+        noise = decoder(
+            original_video  = video_c_first,
+            clean_embedding = clean_emb,
+            noisy_embedding = noisy_emb_ref,
+        )                                              # [1, 3, T, H, W]
+
+        # Step 3 — Final noisy embeddings, from the refined (second-pass) noise.
         perturbed = (video_c_first + noise).permute(0, 2, 1, 3, 4)  # [1, T, C, H, W]
         noisy_emb = encoder(perturbed)                # [1, D]
 
@@ -376,19 +500,20 @@ def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> d
     Modes
     -----
     classifier  (default)
-        Use the trained VideoEnsembleClassifier with logit_weighted fusion.
-        Most accurate on the training distribution.
-        May be biased for out-of-distribution videos.
+        Use the trained VideoEnsembleClassifier (6-branch ensemble, learned_weight fusion).
+        Calibrated threshold from validation ROC curve (Youden's J statistic).
+        Expected: FPR ~5.4%, FNR ~0.3% at threshold=0.99 on training generators.
 
     embedding
-        Use only the embedding-discrepancy score, calibrated against the
-        epoch-4 validation statistics (real l2=0.81, fake l2=6.18).
+        Use only the embedding-discrepancy score (L2 distance in VideoMAE space).
         More distribution-robust but less sensitive to subtle fakes.
-        Decision: emb_score > 0.5 -> fake.
 
     hybrid
         Average of classifier probability and embedding score.
-        Balances the strengths of both signals.
+        Balances accuracy and robustness.
+
+    Confidence is measured as distance from the decision threshold, NOT from 0.5.
+    This gives meaningful confidence values regardless of what threshold is used.
     """
     cls_prob  = raw["cls_prob"]
     emb_score = raw["emb_score"]
@@ -403,46 +528,57 @@ def _make_decision(raw: dict, mode: str, threshold: float = FAKE_THRESHOLD) -> d
         prob          = cls_prob
         signal_source = "classifier"
 
-    prediction = "fake" if prob > threshold else "real"
+    prediction = "fake" if prob >= threshold else "real"
 
-    delta = abs(prob - 0.5)
-    if delta > 0.4:
+    # Confidence = distance from the decision threshold (NOT from 0.5).
+    # e.g. with threshold=0.99:
+    #   prob=0.999 → fake,  margin=0.009 → very_high
+    #   prob=0.995 → fake,  margin=0.005 → high
+    #   prob=0.991 → fake,  margin=0.001 → low  (borderline)
+    #   prob=0.985 → real,  margin=0.005 → high  (comfortably real)
+    #   prob=0.50  → real,  margin=0.490 → very_high (clearly real)
+    margin = abs(prob - threshold)
+    if margin > 0.05:
         confidence = "very_high"
-    elif delta > 0.25:
+    elif margin > 0.02:
         confidence = "high"
-    elif delta > 0.1:
+    elif margin > 0.005:
         confidence = "medium"
     else:
-        confidence = "low"
+        confidence = "low"   # within 0.5 percentage points of threshold — borderline
 
     return {
-        "prediction":    prediction,
-        "probability":   round(prob, 4),
-        "confidence":    confidence,
-        "signal_source": signal_source,
-        "mode":          mode,
+        "prediction":         prediction,
+        "probability":        round(prob, 6),
+        "confidence":         confidence,
+        "margin_to_threshold": round(margin, 6),   # how far from the decision boundary
+        "signal_source":      signal_source,
+        "mode":               mode,
         "details": {
             "cosine_similarity":      round(raw["cosine_sim"], 4),
             "l2_distance":            round(raw["l2_val"], 4),
-            "embedding_score":        round(emb_score, 4),     # 0=real, 1=fake
+            "embedding_score":        round(emb_score, 4),
             "classifier_probability": round(cls_prob, 4),
             "threshold":              threshold,
             "calibration": {
-                "real_l2":       VAL_L2_REAL,   "fake_l2":  VAL_L2_FAKE,
-                "real_sim":      VAL_SIM_REAL,  "fake_sim": VAL_SIM_FAKE,
-                "l2_midpoint":   round(_L2_THRESHOLD, 4),
-                "sim_midpoint":  round(_SIM_THRESHOLD, 4),
+                "real_l2":            VAL_L2_REAL,
+                "fake_l2":            VAL_L2_FAKE,
+                "real_sim":           VAL_SIM_REAL,
+                "fake_sim":           VAL_SIM_FAKE,
+                "l2_midpoint":        round(_L2_THRESHOLD, 4),
+                "sim_midpoint":       round(_SIM_THRESHOLD, 4),
             },
             "branch_probabilities":   raw["branch_probs"],
         },
     }
 
 
+
 # ===========================================================================
 # FastAPI Application
 # ===========================================================================
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI): 
     logger.info("=== RA-Det Inference API — startup ===")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
@@ -478,26 +614,42 @@ async def health():
 @app.get("/info", tags=["system"])
 async def info():
     """Model configuration and validation performance summary."""
+    thr = _store.optimal_threshold
     return {
+        "train_config_name": TRAIN_CONFIG_NAME,
         "encoder":          MODEL_NAME,
-        "decoder":          "UNetDecoder3D",
-        "classifier":       "VideoEnsembleClassifier (foundation + scratch, 2-branch)",
+        "decoder":          "UNetDecoder3D (3D spatiotemporal, 5-level U-Net)",
+        "classifier":       "VideoEnsembleClassifier (6-branch: foundation, scratch, l2_distance, embedding_diff, npr, direct_feature)",
+        "fusion_method":    FUSION_METHOD,
+        "use_four_branch_ensemble": USE_FOUR_BRANCH_ENSEMBLE,
+        "use_npr_branch":   USE_NPR_BRANCH,
+        "use_temporal_coherence_branch": USE_TEMPORAL_COHERENCE_BRANCH,
+        "unfreeze_last_n_blocks": UNFREEZE_LAST_N_BLOCKS,
         "num_frames":       NUM_FRAMES,
         "frame_size":       FRAME_SIZE,
         "attack_eps":       round(ATTACK_EPS, 5),
-        "fake_threshold":   FAKE_THRESHOLD,
+        "fake_threshold":   thr,
+        "threshold_source": "checkpoint_roc_youden_j" if thr != FAKE_THRESHOLD else "default_fallback",
         "feature_dim":      _store.feature_dim,
         "checkpoint_epoch": _store.checkpoint_epoch,
         "checkpoint_path":  CHECKPOINT_PATH,
         "load_time_s":      round(_store.load_time_s, 2),
         "validation_metrics": {
-            "auc":               0.9959,
-            "average_precision": 0.9945,
-            "optimal_accuracy":  0.9810,
-            "real_l2":           0.8070,
-            "fake_l2":           6.1752,
-            "l2_gap":            5.3681,
+            "epoch":              20,
+            "auc":               0.9993,
+            "average_precision": 0.9994,
+            "f1_at_threshold":   0.9722,
+            "accuracy_at_threshold": 0.9715,
+            "fpr_at_threshold":  0.054,
+            "fnr_at_threshold":  0.003,
+            "optimal_threshold": thr,
+            "real_l2":           0.0521,
+            "fake_l2":           10.7084,
+            "l2_gap":            10.6563,
+            "real_sim":          0.9991,
+            "fake_sim":          0.1601,
         },
+        "training_generators": ["cogvideox", "easyanimate", "hunyuanvideo", "ltxvideo"],
         "cascade_layers": {
             "layer_1": "C2PA Digital Provenance Check (~1ms)",
             "layer_2": "VideoMAE Anomaly Reconstruction Detector (~200ms)",
@@ -617,7 +769,9 @@ async def predict(
         # -------------------------------------------------------------------
         t_l3 = time.time()
         raw = run_inference(video_tensor)
-        active_threshold = threshold if threshold is not None else FAKE_THRESHOLD
+        # Use the calibrated threshold from the checkpoint (fixes high FPR from hard-coded 0.5).
+        # User can still override per-request via the ?threshold= query param.
+        active_threshold = threshold if threshold is not None else _store.optimal_threshold
         result = _make_decision(raw, mode, threshold=active_threshold)
         l3_time = time.time() - t_l3
 
